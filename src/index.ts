@@ -4,7 +4,15 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { smoothLogin } from "./login.js";
 import { isLoggedIn, profileDir, closeContext } from "./browser.js";
-import { scanItems, fillListing, publishListing, postListing, listMine, photosInFolder } from "./listing.js";
+import {
+  scanItems,
+  fillListing,
+  publishListing,
+  postListing,
+  listMine,
+  photosInFolder,
+  type ListingDraft,
+} from "./listing.js";
 import { searchComps } from "./comps.js";
 
 const server = new McpServer({
@@ -19,6 +27,45 @@ function img(buf: Buffer) {
 }
 function text(s: string) {
   return { type: "text" as const, text: s };
+}
+
+const extraListingFields = {
+  location: z
+    .string()
+    .optional()
+    .describe(
+      'Optional. Type this into the Location combobox and choose the closest suggestion, e.g. "East Cannington, Western Australia". Omitted leaves the field as Facebook filled it.'
+    ),
+  hide_from_friends: z
+    .boolean()
+    .optional()
+    .describe('Optional. Turn the "Hide from friends" switch on (true) or off (false). Omitted leaves the switch as it is.'),
+  product_tags: z
+    .array(z.string())
+    .optional()
+    .describe(
+      "Optional. Product tags. Each tag is typed and confirmed with Enter. Facebook's tag limit is respected, and any tag that was not added is reported. Omitted leaves tags unchanged."
+    ),
+  share_to_groups: z
+    .array(z.string())
+    .optional()
+    .describe(
+      'Optional. On the "List in more places" step, tick only groups whose names contain one of these (case-insensitive). Every other group checkbox is left unticked. Names that match nothing are reported. Omitted leaves the group checkboxes as Facebook set them. Boost and other paid options are never clicked.'
+    ),
+};
+
+function formatOutcome(r: ListingDraft): string {
+  const lines = [
+    `location: ${r.locationRequested ? r.location ?? "(empty)" : "(not changed)"}`,
+    `hide_from_friends: ${r.hideRequested ? (r.hideFromFriends ? "on" : "off") : "(not changed)"}`,
+    `tags added: ${r.tagsRequested ? (r.tagsAdded.length ? r.tagsAdded.join(", ") : "(none)") : "(not changed)"}`,
+  ];
+  if (r.tagsNotAdded.length) lines.push(`tags not added: ${r.tagsNotAdded.join("; ")}`);
+  lines.push(
+    `groups ticked: ${r.groupsRequested ? (r.groupsTicked.length ? r.groupsTicked.join(", ") : "(none)") : "(not changed)"}`
+  );
+  if (r.groupsNotFound.length) lines.push(`groups not found: ${r.groupsNotFound.join(", ")}`);
+  return lines.join("\n");
 }
 
 server.tool(
@@ -96,7 +143,7 @@ server.tool(
 
 server.tool(
   "post_listing",
-  "Post one item to Marketplace in a single step: uploads the photos, fills the form, checks the review page really shows the title and price it was given, then publishes. This is the normal way to list something. Call it only after the seller has seen the wording and price you propose and agreed to them; show them the text first, in the message, rather than posting and asking afterwards. The price must be the seller's own number, never an estimate. Prefer this over create_listing plus publish_listing, which leave a draft that exists only while the browser stays open and is lost if anything interrupts.",
+  "Post one item to Marketplace in a single step: uploads the photos, fills the form, checks the review page really shows the title and price it was given, then publishes. This is the normal way to list something. Call it only after the seller has seen the wording and price you propose and agreed to them; show them the text first, in the message, rather than posting and asking afterwards. The price must be the seller's own number, never an estimate. Prefer this over create_listing plus publish_listing, which leave a draft that exists only while the browser stays open and is lost if anything interrupts. Optional location, hide_from_friends, product_tags, and share_to_groups do nothing when omitted. Boost, promote, and other paid options are never clicked.",
   {
     title: z.string(),
     price: z
@@ -107,8 +154,9 @@ server.tool(
     condition: z.enum(CONDITIONS),
     folder: z.string().optional().describe("Folder holding this item's photos; every image in it is uploaded, sorted by filename."),
     photos: z.array(z.string()).optional().describe("Explicit photo paths (first is the cover), when picking specific files instead of a folder."),
+    ...extraListingFields,
   },
-  async ({ title, price, description, category, condition, folder, photos }) => {
+  async ({ title, price, description, category, condition, folder, photos, location, hide_from_friends, product_tags, share_to_groups }) => {
     if (!(await isLoggedIn())) {
       return { content: [text("Not logged in. Call fb_login first.")], isError: true };
     }
@@ -118,11 +166,22 @@ server.tool(
     } catch (e) {
       return { content: [text(`${e instanceof Error ? e.message : String(e)}\nPass either "folder" or "photos".`)], isError: true };
     }
-    const { screenshot, url } = await postListing({ title, price, description, category, condition, photos: files });
+    const draft = await postListing({
+      title,
+      price,
+      description,
+      category,
+      condition,
+      photos: files,
+      location,
+      hideFromFriends: hide_from_friends,
+      productTags: product_tags,
+      shareToGroups: share_to_groups,
+    });
     return {
       content: [
-        text(`Published "${title}" at $${price} (${condition}, ${category}). Now at: ${url}`),
-        img(screenshot),
+        text(`Published "${title}" at $${price} (${condition}, ${category}). Now at: ${draft.url}\n${formatOutcome(draft)}`),
+        img(draft.screenshot),
       ],
     };
   }
@@ -130,7 +189,7 @@ server.tool(
 
 server.tool(
   "create_listing",
-  "Fill the form and stop at the review step without publishing, returning a screenshot. Use post_listing instead unless the seller specifically wants to see the filled-in page before it goes live: the draft this leaves behind lives only in the open browser and is lost if the session ends, the browser closes, or anything else interrupts. When you do use it, call publish_listing straight after, in the same session. The price must come from the seller.",
+  "Fill the form and stop at the review step without publishing, returning a screenshot. Use post_listing instead unless the seller specifically wants to see the filled-in page before it goes live: the draft this leaves behind lives only in the open browser and is lost if the session ends, the browser closes, or anything else interrupts. When you do use it, call publish_listing straight after, in the same session. The price must come from the seller. Optional location, hide_from_friends, product_tags, and share_to_groups do nothing when omitted. Boost, promote, and other paid options are never clicked.",
   {
     title: z.string(),
     price: z
@@ -147,8 +206,9 @@ server.tool(
       .array(z.string())
       .optional()
       .describe("Explicit photo paths (first is the cover). Only needed when picking specific files instead of a whole folder."),
+    ...extraListingFields,
   },
-  async ({ title, price, description, category, condition, folder, photos }) => {
+  async ({ title, price, description, category, condition, folder, photos, location, hide_from_friends, product_tags, share_to_groups }) => {
     if (!(await isLoggedIn())) {
       return { content: [text("Not logged in. Call fb_login first.")], isError: true };
     }
@@ -158,11 +218,24 @@ server.tool(
     } catch (e) {
       return { content: [text(`${e instanceof Error ? e.message : String(e)}\nPass either "folder" or "photos".`)], isError: true };
     }
-    const shot = await fillListing({ title, price, description, category, condition, photos: files });
+    const draft = await fillListing({
+      title,
+      price,
+      description,
+      category,
+      condition,
+      photos: files,
+      location,
+      hideFromFriends: hide_from_friends,
+      productTags: product_tags,
+      shareToGroups: share_to_groups,
+    });
     return {
       content: [
-        text(`Draft ready for review: "${title}" — $${price} (${condition}, ${category}). Review the screenshot, then call publish_listing to publish, or discard by navigating away.`),
-        img(shot),
+        text(
+          `Draft ready for review: "${title}" — $${price} (${condition}, ${category}). Review the screenshot, then call publish_listing to publish, or discard by navigating away.\n${formatOutcome(draft)}`
+        ),
+        img(draft.screenshot),
       ],
     };
   }
@@ -170,7 +243,7 @@ server.tool(
 
 server.tool(
   "publish_listing",
-  "Publish the listing currently on the review step (created by create_listing). Only call after the review screenshot has been confirmed. Returns the resulting URL.",
+  "Publish the listing currently on the review step (created by create_listing). Only call after the review screenshot has been confirmed. Returns the resulting URL. Never clicks a Boost, promote, or other paid option.",
   {},
   async () => {
     const url = await publishListing();
