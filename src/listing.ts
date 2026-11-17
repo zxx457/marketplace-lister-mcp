@@ -229,8 +229,14 @@ async function pickFromCombobox(page: Page, comboLabel: string, optionText: stri
  * - Location: `input[role=combobox][aria-label="Location"]` (fallback
  *   `label[role=combobox]` whose text starts "Location"), then a visible
  *   `[role=option]` / `[role=listbox]` suggestion.
- * - More details: `[role=button]` accessible name "More details", or
- *   `span:text-is("More details")`.
+ * - More details: button whose name starts "More details", or
+ *   `span:text-is("More details")` (clicked via its `role=button` ancestor).
+ *   On the AU create form (Nov 2026) Description stays hidden until this opens.
+ * - Description: `label:has-text("Description") textarea`,
+ *   `textarea[aria-label*="Description"]`, then any other textarea in that
+ *   section. The old 10s fill ran before Category and before the section was
+ *   opened, so it never saw the field. These locators are still untested
+ *   against a completed live fill.
  * - Product tags: `textarea[aria-label="Product tags"]` or
  *   `input[aria-label="Product tags"]`, then `label:has-text("Product tags")`
  *   textarea/input. Chips are leaf text or an aria-label containing "remove".
@@ -326,10 +332,16 @@ function bestLocation(suggestions: string[], query: string): { text: string; sco
 }
 
 async function moreDetailsControl(page: Page): Promise<Locator | null> {
-  const byName = page.getByRole("button", { name: "More details", exact: true });
+  const byName = page.getByRole("button", { name: /^More details\b/i });
   if (await byName.count()) return byName.first();
   const span = page.locator('span:text-is("More details")').first();
-  if (await span.count()) return span;
+  if (await span.count()) {
+    const parentButton = span.locator('xpath=ancestor::*[@role="button"][1]');
+    if (await parentButton.count()) return parentButton;
+    return span;
+  }
+  const header = page.getByText("More details", { exact: true }).first();
+  if (await header.count()) return header;
   return null;
 }
 
@@ -342,15 +354,107 @@ async function ensureMoreDetails(page: Page, state: FormState): Promise<"ready" 
     state.moreDetailsMissing = true;
     return "missing";
   }
+  const label = (
+    (await button.getAttribute("aria-label")) ||
+    (await button.innerText().catch(() => "")) ||
+    ""
+  )
+    .split("\n")[0]
+    .trim();
+  if (isPaidListingControl(label)) {
+    throw new Error(`Refusing to click "${label}" because it is a Boost, promote, or other paid option.`);
+  }
   const expanded = await button.getAttribute("aria-expanded");
   if (expanded !== "true") {
+    await button.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => {});
     await button.click({ timeout: 8000 });
-    await page.waitForTimeout(700);
-    const after = await button.getAttribute("aria-expanded");
-    if (after === "false") throw new Error('"More details" stayed collapsed after it was clicked.');
+    await page.waitForTimeout(800);
   }
   state.moreDetailsHandled = true;
   return "ready";
+}
+
+const DESCRIPTION_WAIT_MS = 20000;
+
+/**
+ * Description sits inside collapsed More details on the current create form,
+ * and it can be absent until Category is chosen. Prefer the labelled field,
+ * then an aria-label, then any other textarea in that section (not Product tags).
+ */
+async function findVisibleDescription(page: Page): Promise<Locator | null> {
+  const labelled = page.locator('label:has-text("Description") textarea');
+  const labelledCount = await labelled.count();
+  for (let i = 0; i < labelledCount; i++) {
+    const field = labelled.nth(i);
+    if (await field.isVisible().catch(() => false)) return field;
+  }
+
+  const byAria = page.locator('textarea[aria-label*="Description"], textarea[aria-label*="description"]');
+  const ariaCount = await byAria.count();
+  for (let i = 0; i < ariaCount; i++) {
+    const field = byAria.nth(i);
+    if (await field.isVisible().catch(() => false)) return field;
+  }
+
+  const areas = page.locator("textarea");
+  const areaCount = await areas.count();
+  for (let i = 0; i < areaCount; i++) {
+    const field = areas.nth(i);
+    if (!(await field.isVisible().catch(() => false))) continue;
+    const inSection = await field.evaluate((el) => {
+      const aria = (el.getAttribute("aria-label") || "").toLowerCase();
+      if (aria.includes("product tags")) return false;
+      const labelText = (el.closest("label")?.innerText || "").replace(/\s+/g, " ").trim().toLowerCase();
+      if (labelText.startsWith("product tags")) return false;
+      let node: HTMLElement | null = el.parentElement;
+      for (let depth = 0; depth < 10 && node; depth++) {
+        const header = [...node.querySelectorAll("span, div, h2, h3")].find((candidate) => {
+          if (candidate === el || el.contains(candidate)) return false;
+          const text = (candidate.textContent || "").replace(/\s+/g, " ").trim();
+          return text === "More details";
+        });
+        if (header) return true;
+        node = node.parentElement;
+      }
+      return false;
+    });
+    if (inSection) return field;
+  }
+  return null;
+}
+
+async function fillDescription(page: Page, state: FormState, description: string): Promise<void> {
+  let field = await findVisibleDescription(page);
+  if (field) {
+    // Already on screen, so More details is open. A later click would collapse it.
+    state.moreDetailsHandled = true;
+    state.moreDetailsMissing = false;
+  } else {
+    const opened = await ensureMoreDetails(page, state);
+    const deadline = Date.now() + DESCRIPTION_WAIT_MS;
+    while (Date.now() < deadline) {
+      field = await findVisibleDescription(page);
+      if (field) break;
+      await page.waitForTimeout(400);
+    }
+    if (!field) {
+      throw new Error(
+        opened === "missing"
+          ? `Description is not on the form, and there was no "More details" section to open (now at ${page.url()}).`
+          : `Description did not appear within 20s of opening "More details" (now at ${page.url()}). Category and Condition were already set.`
+      );
+    }
+  }
+
+  await field.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => {});
+  await field.fill(description, { timeout: DESCRIPTION_WAIT_MS });
+  const wanted = description.replace(/\s+/g, " ").trim();
+  const shown = ((await field.inputValue().catch(() => "")) || "").replace(/\s+/g, " ").trim();
+  if (wanted && !shown.startsWith(wanted.slice(0, Math.min(40, wanted.length)))) {
+    throw new Error(
+      `Description field does not show the text that was entered (it shows "${shown.slice(0, 80)}").`
+    );
+  }
 }
 
 async function findLocationInput(page: Page): Promise<Locator | null> {
@@ -1001,12 +1105,14 @@ export async function fillListing(input: ListingInput): Promise<ListingDraft> {
 
   await page.fill('label:has-text("Title") input', input.title, { timeout: 10000 });
   await page.fill('label:has-text("Price") input', String(input.price), { timeout: 10000 });
-  await page.fill('label:has-text("Description") textarea', input.description, { timeout: 10000 });
 
+  // Category (and Condition) come before Description. On the current form the
+  // textarea is inside collapsed More details and may not exist until a category is chosen.
   await pickFromCombobox(page, "Category", input.category);
   await pickFromCombobox(page, "Condition", input.condition);
 
   const state: FormState = { moreDetailsHandled: false, moreDetailsMissing: false };
+  await fillDescription(page, state, input.description);
   const tagsRequested = (input.productTags ?? []).some((tag) => tag.trim());
   const draft: ListingDraft = {
     screenshot: Buffer.alloc(0),
