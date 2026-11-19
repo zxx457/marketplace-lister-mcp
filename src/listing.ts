@@ -168,6 +168,84 @@ async function gotoCreate(page: Page): Promise<void> {
 }
 
 /**
+ * Close Facebook error/blocking modals that sit on top of the create form.
+ *
+ * A failed or flaky photo upload often raises an "Oops / Something went wrong"
+ * dialog. Its __fb-light-mode backdrop keeps receiving pointer events, so later
+ * clicks (especially Category) time out even though the combobox is visible.
+ * Only these error dialogs are dismissed; category dropdowns and paid/Boost
+ * controls are left alone. Clicks are real UI clicks, never force:true.
+ */
+async function dismissBlockingDialogs(page: Page): Promise<string[]> {
+  const dismissed: string[] = [];
+  const dialogs = page.locator('[role="dialog"][aria-modal="true"], [role="alertdialog"]');
+  const count = await dialogs.count();
+  for (let i = 0; i < count; i++) {
+    const dialog = dialogs.nth(i);
+    if (!(await dialog.isVisible().catch(() => false))) continue;
+    const label = ((await dialog.getAttribute("aria-label")) || "").trim();
+    const text = ((await dialog.innerText().catch(() => "")) || "").replace(/\s+/g, " ").trim();
+    const blob = `${label} ${text}`;
+    if (!/oops|something went wrong|you may be able to try again/i.test(blob)) continue;
+    const close = dialog
+      .locator(
+        '[aria-label="Close"], [aria-label="close"], [role="button"]:has-text("Close"), div[role="button"]:has-text("Close")'
+      )
+      .first();
+    if ((await close.count()) === 0) {
+      await page.keyboard.press("Escape");
+    } else {
+      await close.click({ timeout: 5000 });
+    }
+    await dialog.waitFor({ state: "hidden", timeout: 8000 }).catch(() => {});
+    dismissed.push(label || text.slice(0, 80));
+  }
+  return dismissed;
+}
+
+/** How many photos the create form currently shows as attached. */
+async function attachedPhotoCount(page: Page): Promise<number> {
+  const text = ((await page.locator("body").innerText().catch(() => "")) || "").replace(/\s+/g, " ");
+  const slash = text.match(/Photos\s*[·•]\s*(\d+)\s*\/\s*\d+/i);
+  if (slash) return Number(slash[1]);
+  const words = text.match(/(\d+)\s+photos? attached/i);
+  if (words) return Number(words[1]);
+  return 0;
+}
+
+/**
+ * Attach photos and wait until the form shows them. If Facebook raises the
+ * Oops modal (upload failed, 0 attached), close it and retry a few times
+ * instead of continuing on to Category, which would then be unclickable.
+ */
+async function uploadPhotos(page: Page, photos: string[]): Promise<void> {
+  const fileInput = 'input[type=file][accept*="image"]';
+  let lastDialog = "";
+  for (let attempt = 0; attempt < 3; attempt++) {
+    await dismissBlockingDialogs(page);
+    await page.setInputFiles(fileInput, photos, { timeout: 20000 });
+    const deadline = Date.now() + 20000;
+    while (Date.now() < deadline) {
+      const dismissed = await dismissBlockingDialogs(page);
+      if (dismissed.length) {
+        lastDialog = dismissed.join("; ");
+        break;
+      }
+      if ((await attachedPhotoCount(page)) >= photos.length) return;
+      await page.waitForTimeout(500);
+    }
+    if ((await attachedPhotoCount(page)) >= photos.length) return;
+    await page.waitForTimeout(1500 + attempt * 1500);
+  }
+  const got = await attachedPhotoCount(page);
+  throw new Error(
+    `Photos did not attach to the create form (got ${got} of ${photos.length}` +
+      (lastDialog ? ` after Facebook showed: ${lastDialog}` : "") +
+      "). Nothing was published."
+  );
+}
+
+/**
  * Choose an option from one of the form's comboboxes.
  *
  * The option list is virtualised: entries that need scrolling are not in the
@@ -177,7 +255,19 @@ async function gotoCreate(page: Page): Promise<void> {
  * instead of guessing.
  */
 async function pickFromCombobox(page: Page, comboLabel: string, optionText: string): Promise<void> {
-  await page.click(`label[role=combobox]:has-text("${comboLabel}")`, { timeout: 15000 });
+  const combo = `label[role=combobox]:has-text("${comboLabel}")`;
+  await dismissBlockingDialogs(page);
+  try {
+    await page.click(combo, { timeout: 8000 });
+  } catch (err) {
+    // Overlay may have appeared after the first dismiss; close and try once more.
+    await dismissBlockingDialogs(page);
+    try {
+      await page.click(combo, { timeout: 8000 });
+    } catch {
+      throw err instanceof Error ? err : new Error(String(err));
+    }
+  }
   await page.waitForTimeout(1200);
 
   const seen = new Set<string>();
@@ -1099,12 +1189,12 @@ export async function fillListing(input: ListingInput): Promise<ListingDraft> {
   await gotoCreate(page);
   await page.waitForTimeout(2500);
 
-  const fileInput = 'input[type=file][accept*="image"]';
-  await page.setInputFiles(fileInput, input.photos, { timeout: 20000 });
-  await page.waitForTimeout(3500);
+  await uploadPhotos(page, input.photos);
+  await dismissBlockingDialogs(page);
 
   await page.fill('label:has-text("Title") input', input.title, { timeout: 10000 });
   await page.fill('label:has-text("Price") input', String(input.price), { timeout: 10000 });
+  await dismissBlockingDialogs(page);
 
   // Category (and Condition) come before Description. On the current form the
   // textarea is inside collapsed More details and may not exist until a category is chosen.
@@ -1144,6 +1234,7 @@ export async function fillListing(input: ListingInput): Promise<ListingDraft> {
   }
 
   // Advance to the audience / review step.
+  await dismissBlockingDialogs(page);
   await clickFormButton(page, "Next");
   await page.waitForTimeout(2500);
 
@@ -1176,9 +1267,12 @@ export async function postListing(input: ListingInput): Promise<ListingDraft & {
   const page = await getPage();
   const review = await page.innerText("body");
   const priceText = String(input.price).replace(/[^0-9.]/g, "");
+  // Facebook renders 1120 as "$1,120" on the review preview, so a raw
+  // includes("1120") misses a correctly filled price.
+  const reviewForPrice = review.replace(/,/g, "");
   const missing: string[] = [];
   if (!review.includes(input.title.slice(0, 40))) missing.push("title");
-  if (priceText && !review.includes(priceText)) missing.push("price");
+  if (priceText && !review.includes(priceText) && !reviewForPrice.includes(priceText)) missing.push("price");
   if (missing.length) {
     throw new Error(
       `Stopping before publish: the review page does not show the ${missing.join(" or ")} that was asked for. ` +
