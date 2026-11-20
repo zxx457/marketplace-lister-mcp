@@ -174,7 +174,10 @@ const PHOTO_PAUSE_MIN_MS = 800;
 const PHOTO_PAUSE_MAX_MS = 2000;
 const PER_PHOTO_WAIT_MS = 15000;
 const UPLOAD_SETTLE_MS = 20000;
-/** Initial fill plus this many full reloads when the create form itself crashes. */
+/**
+ * Initial fill plus this many full reloads when the create form crashes, or
+ * when an Oops dialog leaves none or only some of the photos attached.
+ */
 const MAX_FORM_RETRIES = 2;
 const FILE_INPUT = 'input[type=file][accept*="image"]';
 const DIALOG_SELECTOR = '[role="dialog"][aria-modal="true"], [role="alertdialog"]';
@@ -188,11 +191,45 @@ const OOPS_RE = /oops|something went wrong|you may be able to try again/i;
  */
 const oopsSeenOnPage = new WeakMap<Page, boolean>();
 
-class FormCrashedError extends Error {
+/**
+ * The fill loop reloads the create page and starts over for these only.
+ * A plain Error is not retried: a missing file input, or photos that never
+ * appeared without an Oops dialog, will not recover by filling the same way.
+ */
+class RetryableListingError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RetryableListingError";
+  }
+}
+
+class FormCrashedError extends RetryableListingError {
   constructor(message: string) {
     super(message);
     this.name = "FormCrashedError";
   }
+}
+
+/** Oops left the composer on screen with none or only some of the photos. */
+class PhotoOopsError extends RetryableListingError {
+  constructor(message: string) {
+    super(message);
+    this.name = "PhotoOopsError";
+  }
+}
+
+/** True for a blank composer or an Oops that left the photos short. */
+export function isRetryableListingFailure(err: unknown): boolean {
+  return err instanceof RetryableListingError;
+}
+
+/**
+ * After per-file upload hits Oops, the next reload sends every photo in one
+ * setInputFiles call. A blank-composer crash keeps the per-file attempt,
+ * which itself falls back to that one call if it again lands zero photos.
+ */
+export function uploadModeAfterFailure(preferBatch: boolean, err: unknown): boolean {
+  return preferBatch || err instanceof PhotoOopsError;
 }
 
 function randMs(min: number, max: number): number {
@@ -334,7 +371,8 @@ async function betweenSteps(page: Page): Promise<void> {
 /** How many photos the create form currently shows as attached, from its own counter. */
 async function attachedPhotoCount(page: Page): Promise<number> {
   const text = ((await page.locator("body").innerText().catch(() => "")) || "").replace(/\s+/g, " ");
-  const slash = text.match(/Photos\s*[·•]\s*(\d+)\s*\/\s*\d+/i);
+  // The dot is the usual separator ("Photos · 0/10"). A plain "Photos 0/10" counts too.
+  const slash = text.match(/Photos\s*[·•]?\s*(\d+)\s*\/\s*\d+/i);
   if (slash) return Number(slash[1]);
   const words = text.match(/(\d+)\s+photos? attached/i);
   if (words) return Number(words[1]);
@@ -445,68 +483,160 @@ async function waitForNewThumbnail(
   return (await thumbnailCount(page)) > before;
 }
 
-/**
- * Attach photos one at a time.
- *
- * Hypothesis, not a confirmed cause: setting every file on the input at once
- * and immediately moving on is what makes the composer throw "Oops" over a
- * blank page. A single file is set per call, the file input is re-queried
- * each time, and the next photo waits until a new thumbnail appears (or a
- * bounded timeout) plus a short pause. Other fields are not touched until
- * the thumbnails are all present and no upload spinner is showing, or until
- * that settle wait ends. A spinner still visible after the wait does not
- * fail the listing once every thumbnail is there.
- */
-async function uploadPhotos(page: Page, photos: string[]): Promise<void> {
-  const dialogs = { last: "" };
-  const note = (labels: string[]) => {
-    if (labels.length) dialogs.last = labels.join("; ");
-  };
+interface UploadSeen {
+  oops: boolean;
+  labels: string;
+}
 
+function rememberOops(seen: UploadSeen, labels: string[]): void {
+  if (!labels.length) return;
+  seen.oops = true;
+  seen.labels = labels.join("; ");
+}
+
+function unfinishedPhotosMessage(count: number, expected: number, labels: string, sentTogether: boolean): string {
+  const why = labels ? ` after Facebook showed: ${labels}` : "";
+  const together = sentTogether ? " All photos were sent in one upload and still did not finish." : "";
+  return `Photos did not finish uploading (got ${count} of ${expected}${why}).${together}`;
+}
+
+/** The file input the create form uses to attach photos. Throws when it is gone. */
+async function requireFileInput(page: Page, seen: UploadSeen, expected: number): Promise<Locator> {
+  const input = page.locator(FILE_INPUT).first();
+  if ((await input.count().catch(() => 0)) > 0) return input;
+  const count = await thumbnailCount(page);
+  if (!(await createFormPresent(page))) {
+    const which = seen.labels ? ` after Facebook showed: ${seen.labels}` : "";
+    throw new FormCrashedError(
+      `The create form went blank while attaching photos (got ${count} of ${expected}${which}) at ${page.url()}.`
+    );
+  }
+  if (seen.oops) {
+    throw new PhotoOopsError(
+      `${unfinishedPhotosMessage(count, expected, seen.labels, false)} The photo file input was gone.`
+    );
+  }
+  throw new Error(`Could not find the photo file input on the create form (now at ${page.url()}).`);
+}
+
+/**
+ * Put every photo on the file input in one call. Returns how many thumbnails
+ * are showing afterwards. A spinner still visible after the settle wait does
+ * not count as failure once every thumbnail is there.
+ */
+async function uploadPhotosTogether(page: Page, photos: string[], seen: UploadSeen): Promise<number> {
+  const note = (labels: string[]) => rememberOops(seen, labels);
+  note(await dismissOrCrash(page));
+  const input = await requireFileInput(page, seen, photos.length);
+  try {
+    await input.setInputFiles(photos, { timeout: 15000 });
+  } catch (err) {
+    if (isRetryableListingFailure(err)) throw err;
+    note(await dismissOrCrash(page));
+    if (!(await createFormPresent(page))) {
+      throw new FormCrashedError(
+        `The create form went blank while attaching all ${photos.length} photos together at ${page.url()}.`
+      );
+    }
+  }
+  const deadline = Date.now() + UPLOAD_SETTLE_MS;
+  while (Date.now() < deadline) {
+    note(await dismissOrCrash(page));
+    const state = await photoAreaState(page);
+    if (state.count >= photos.length && !state.busy) return state.count;
+    await page.waitForTimeout(400);
+  }
+  note(await dismissOrCrash(page));
+  return (await photoAreaState(page)).count;
+}
+
+/**
+ * Oops plus a short thumbnail count reloads the create page. Zero thumbnails
+ * on a form that is still up get one all-files upload first; a partial count
+ * does not, because Facebook appends files and the ones already showing
+ * would be duplicated. The reload that follows sends every photo in one call.
+ */
+async function finishShortUpload(
+  page: Page,
+  photos: string[],
+  seen: UploadSeen,
+  count: number,
+  batchTried: boolean
+): Promise<void> {
+  let total = count;
+  let tried = batchTried;
+  if (!tried && seen.oops && total === 0 && (await createFormPresent(page))) {
+    tried = true;
+    await pause(page, PHOTO_PAUSE_MIN_MS, PHOTO_PAUSE_MAX_MS);
+    total = await uploadPhotosTogether(page, photos, seen);
+  }
+  if (total >= photos.length) return;
+  const present = await createFormPresent(page);
+  const which = seen.labels ? ` after Facebook showed: ${seen.labels}` : "";
+  if (!present) {
+    throw new FormCrashedError(
+      `The create form went blank after attaching photos (got ${total} of ${photos.length}${which}) at ${page.url()}.`
+    );
+  }
+  if (seen.oops) {
+    throw new PhotoOopsError(unfinishedPhotosMessage(total, photos.length, seen.labels, tried));
+  }
+  throw new Error(
+    `Photos did not finish uploading (got ${total} of ${photos.length}). Nothing was published.`
+  );
+}
+
+/**
+ * Attach photos one at a time, then fall back to one upload of every file.
+ *
+ * One file is set per call, the file input is re-queried each time, and the
+ * next photo waits until a new thumbnail appears (or a bounded timeout) plus
+ * a short pause. If Oops shows and that photo never appears, one-at-a-time
+ * stops. With zero thumbnails and the form still on screen, every photo is
+ * sent again in a single setInputFiles call. preferBatch skips one-at-a-time:
+ * the caller sets it on a reload after per-file upload already hit Oops, so
+ * the fresh form gets every photo in that one call.
+ *
+ * Other fields are not touched until the thumbnails are all present and no
+ * upload spinner is showing, or until that settle wait ends. A spinner still
+ * visible after the wait does not fail the listing once every thumbnail is there.
+ */
+export async function uploadPhotos(page: Page, photos: string[], preferBatch = false): Promise<void> {
+  const seen: UploadSeen = { oops: false, labels: "" };
+  const note = (labels: string[]) => rememberOops(seen, labels);
+
+  if (preferBatch) {
+    const count = await uploadPhotosTogether(page, photos, seen);
+    if (count >= photos.length) return;
+    await finishShortUpload(page, photos, seen, count, true);
+    return;
+  }
+
+  let stoppedForOops = false;
   for (let i = 0; i < photos.length; i++) {
     const photo = photos[i];
     const before = await thumbnailCount(page);
 
-    const send = async (): Promise<boolean> => {
+    note(await dismissOrCrash(page));
+    const input = await requireFileInput(page, seen, photos.length);
+    try {
+      await input.setInputFiles([photo], { timeout: 15000 });
+    } catch (err) {
+      if (isRetryableListingFailure(err)) throw err;
       note(await dismissOrCrash(page));
-      const input = page.locator(FILE_INPUT).first();
-      if ((await input.count().catch(() => 0)) === 0) {
-        if (!(await createFormPresent(page))) {
-          throw new FormCrashedError(
-            `The create form went blank before photo ${i + 1} of ${photos.length} (${path.basename(photo)}) at ${page.url()}.`
-          );
-        }
-        throw new Error(`Could not find the photo file input on the create form (now at ${page.url()}).`);
+      if (!(await createFormPresent(page))) {
+        throw new FormCrashedError(
+          `The create form went blank while attaching photo ${i + 1} of ${photos.length} (${path.basename(photo)}) at ${page.url()}.`
+        );
       }
-      let oops = false;
-      try {
-        await input.setInputFiles([photo], { timeout: 15000 });
-      } catch (err) {
-        if (err instanceof FormCrashedError) throw err;
-        const labels = await dismissOrCrash(page);
-        note(labels);
-        if (labels.length) oops = true;
-        if (!(await createFormPresent(page))) {
-          throw new FormCrashedError(
-            `The create form went blank while attaching photo ${i + 1} of ${photos.length} (${path.basename(photo)}) at ${page.url()}.`
-          );
-        }
-      }
-      return oops;
-    };
+    }
 
-    let sawOops = await send();
-    const incremented = await waitForNewThumbnail(page, before, PER_PHOTO_WAIT_MS, (labels) => {
-      note(labels);
-      if (labels.length) sawOops = true;
-    });
-
-    // One more try only when Facebook showed Oops and this photo never appeared.
-    // A slow preview is not sent twice, or the listing would gain a duplicate.
-    if (!incremented && sawOops && (await thumbnailCount(page)) <= before) {
-      await pause(page, PHOTO_PAUSE_MIN_MS, PHOTO_PAUSE_MAX_MS);
-      await send();
-      await waitForNewThumbnail(page, before, PER_PHOTO_WAIT_MS, note);
+    const incremented = await waitForNewThumbnail(page, before, PER_PHOTO_WAIT_MS, note);
+    // This photo never appeared and Facebook showed Oops. Stop one-at-a-time
+    // rather than sending the same file again; the fallback sends them all.
+    if (!incremented && seen.oops && (await thumbnailCount(page)) <= before) {
+      stoppedForOops = true;
+      break;
     }
 
     if ((await thumbnailCount(page)) <= before && !(await createFormPresent(page))) {
@@ -518,25 +648,19 @@ async function uploadPhotos(page: Page, photos: string[]): Promise<void> {
     if (i < photos.length - 1) await pause(page, PHOTO_PAUSE_MIN_MS, PHOTO_PAUSE_MAX_MS);
   }
 
-  const deadline = Date.now() + UPLOAD_SETTLE_MS;
-  while (Date.now() < deadline) {
-    note(await dismissOrCrash(page));
-    const state = await photoAreaState(page);
-    if (state.count >= photos.length && !state.busy) return;
-    await page.waitForTimeout(400);
+  if (!stoppedForOops) {
+    const deadline = Date.now() + UPLOAD_SETTLE_MS;
+    while (Date.now() < deadline) {
+      note(await dismissOrCrash(page));
+      const state = await photoAreaState(page);
+      if (state.count >= photos.length && !state.busy) return;
+      await page.waitForTimeout(400);
+    }
   }
+
   const state = await photoAreaState(page);
   if (state.count >= photos.length) return;
-  if (!(await createFormPresent(page))) {
-    throw new FormCrashedError(
-      `The create form went blank after attaching photos (got ${state.count} of ${photos.length}) at ${page.url()}.`
-    );
-  }
-  throw new Error(
-    `Photos did not finish uploading (got ${state.count} of ${photos.length}` +
-      (dialogs.last ? ` after Facebook showed: ${dialogs.last}` : "") +
-      "). Nothing was published."
-  );
+  await finishShortUpload(page, photos, seen, state.count, false);
 }
 
 /**
@@ -1472,16 +1596,16 @@ async function clickFormButton(page: Page, label: "Next" | "Publish"): Promise<v
 }
 
 /**
- * PNG written when a crashed create form does not recover. There was no
- * on-disk debug screenshot before this; the review image is only returned to
- * the tool caller. The file lives beside the Facebook profile directory.
+ * PNG written when a create attempt fails. The review image returned to the
+ * tool caller is separate; this file is only for a failure. It lives beside
+ * the Facebook profile directory.
  */
 async function saveDebugScreenshot(page: Page): Promise<string> {
   try {
     const dir = path.join(path.dirname(profileDir()), "debug");
     fs.mkdirSync(dir, { recursive: true });
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const file = path.join(dir, `create-form-${stamp}.png`);
+    const file = path.join(dir, `create-form-${stamp}-${Math.random().toString(36).slice(2, 8)}.png`);
     await page.screenshot({ path: file });
     return file;
   } catch {
@@ -1489,12 +1613,54 @@ async function saveDebugScreenshot(page: Page): Promise<string> {
   }
 }
 
+function hasDebugScreenshotNote(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err ?? "");
+  return /Debug screenshot:|debug screenshot could not be saved/i.test(message);
+}
+
+function withDebugNote(message: string, shot: string): string {
+  if (/Debug screenshot:|debug screenshot could not be saved/i.test(message)) return message;
+  const published = /nothing was (published|posted)/i.test(message) ? "" : " Nothing was published.";
+  const shotNote = shot ? ` Debug screenshot: ${shot}` : " A debug screenshot could not be saved.";
+  return `${message}${published}${shotNote}`;
+}
+
+function failurePrefix(err: unknown, attempt: number): string {
+  if (err instanceof FormCrashedError) {
+    return `The create form crashed and did not recover after ${MAX_FORM_RETRIES} full retries.`;
+  }
+  if (err instanceof PhotoOopsError) {
+    return (
+      `Photo upload still failed after ${MAX_FORM_RETRIES} full retries ` +
+      `(the create page was reloaded and filled from scratch each time).`
+    );
+  }
+  if (attempt > 0) {
+    return `Stopped after reloading the create page ${attempt} time${attempt === 1 ? "" : "s"}.`;
+  }
+  return "";
+}
+
+/**
+ * Attach a debug screenshot to a failure and stop. Call this only when the
+ * attempt will not be retried, so the path in the error is the page the
+ * caller still has on screen.
+ */
+export async function throwListingFailure(page: Page | undefined, err: unknown, prefix = ""): Promise<never> {
+  const shot = page ? await saveDebugScreenshot(page) : "";
+  const raw = err instanceof Error ? err.message : String(err ?? "Listing failed");
+  const combined = prefix ? `${prefix} ${raw}` : raw;
+  throw new Error(withDebugNote(combined, shot), { cause: err });
+}
+
 /**
  * Fill the create form once and stop on the review step. Does not publish.
  * Photos, then each field, are separated by a short randomized pause.
+ * preferBatch sends every photo in one setInputFiles call. That is the
+ * reload after one-at-a-time upload already hit Oops.
  */
-async function fillCreateForm(page: Page, input: ListingInput): Promise<ListingDraft> {
-  await uploadPhotos(page, input.photos);
+async function fillCreateForm(page: Page, input: ListingInput, preferBatch = false): Promise<ListingDraft> {
+  await uploadPhotos(page, input.photos, preferBatch);
 
   await betweenSteps(page);
   await page.fill('label:has-text("Title") input', input.title, { timeout: 10000 });
@@ -1570,43 +1736,42 @@ async function fillCreateForm(page: Page, input: ListingInput): Promise<ListingD
  * only when those fields are passed. Boost / promote / paid controls are never
  * clicked.
  *
- * If an Oops dialog leaves the create form blank, the create page is loaded
- * again and the fill starts over. That happens at most twice. Those retries
- * do not publish.
+ * If an Oops dialog leaves the create form blank, or leaves it up with none
+ * or only some of the photos, the create page is loaded again and the fill
+ * starts over. That happens at most twice, with about 8s then 16s of back-off.
+ * After a photo-upload Oops, the reload sends every photo in one file-input
+ * call. Those retries do not publish. Whatever failure is given up on saves
+ * a debug screenshot and includes its path in the error.
  */
 export async function fillListing(input: ListingInput): Promise<ListingDraft> {
   for (const p of input.photos) {
     if (!fs.existsSync(p)) throw new Error(`Photo not found: ${p}`);
   }
-  let page = await getPage();
+  let page: Page | undefined;
+  let preferBatch = false;
   let lastError: unknown;
+  let failedAttempt = 0;
   for (let attempt = 0; attempt <= MAX_FORM_RETRIES; attempt++) {
-    page = await getPage();
-    if (attempt > 0) {
-      // Longer than the 400–1200ms step pauses: ~8s, then ~16s, plus a little jitter.
-      const backoff = (attempt === 1 ? 8000 : 16000) + randMs(0, 2000);
-      await page.waitForTimeout(backoff);
-    }
-    oopsSeenOnPage.set(page, false);
     try {
+      page = await getPage();
+      if (attempt > 0) {
+        // Longer than the 400–1200ms step pauses: ~8s, then ~16s, plus a little jitter.
+        const backoff = (attempt === 1 ? 8000 : 16000) + randMs(0, 2000);
+        await page.waitForTimeout(backoff);
+      }
+      oopsSeenOnPage.set(page, false);
       await gotoCreate(page);
       await page.waitForTimeout(2500);
-      return await fillCreateForm(page, input);
+      return await fillCreateForm(page, input, preferBatch);
     } catch (err) {
       lastError = err;
-      if (err instanceof FormCrashedError && attempt < MAX_FORM_RETRIES) continue;
+      failedAttempt = attempt;
+      preferBatch = uploadModeAfterFailure(preferBatch, err);
+      if (isRetryableListingFailure(err) && attempt < MAX_FORM_RETRIES) continue;
       break;
     }
   }
-  if (lastError instanceof FormCrashedError) {
-    const shot = await saveDebugScreenshot(page);
-    throw new Error(
-      `The create form crashed and did not recover after ${MAX_FORM_RETRIES} full retries. ` +
-        `${lastError.message} Nothing was published.` +
-        (shot ? ` Debug screenshot: ${shot}` : " A debug screenshot could not be saved.")
-    );
-  }
-  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+  return throwListingFailure(page, lastError, failurePrefix(lastError, failedAttempt));
 }
 
 /**
@@ -1634,9 +1799,12 @@ export async function postListing(input: ListingInput): Promise<ListingDraft & {
   if (!review.includes(input.title.slice(0, 40))) missing.push("title");
   if (priceText && !review.includes(priceText) && !reviewForPrice.includes(priceText)) missing.push("price");
   if (missing.length) {
-    throw new Error(
-      `Stopping before publish: the review page does not show the ${missing.join(" or ")} that was asked for. ` +
-        `Nothing was posted. Check the form and try again.`
+    await throwListingFailure(
+      page,
+      new Error(
+        `Stopping before publish: the review page does not show the ${missing.join(" or ")} that was asked for. ` +
+          `Nothing was posted. Check the form and try again.`
+      )
     );
   }
 
@@ -1654,25 +1822,30 @@ export async function postListing(input: ListingInput): Promise<ListingDraft & {
  */
 export async function publishListing(): Promise<string> {
   const page = await getPage();
-  const publish = page.locator('div[role=button]:has-text("Publish"), span:text-is("Publish")').first();
-  if ((await publish.count()) === 0) {
-    throw new Error(
-      "No draft is waiting to be published (currently at " +
-        page.url() +
-        "). A draft only survives while the browser stays open, so run create_listing again and publish without restarting in between."
-    );
+  try {
+    const publish = page.locator('div[role=button]:has-text("Publish"), span:text-is("Publish")').first();
+    if ((await publish.count()) === 0) {
+      throw new Error(
+        "No draft is waiting to be published (currently at " +
+          page.url() +
+          "). A draft only survives while the browser stays open, so run create_listing again and publish without restarting in between."
+      );
+    }
+    const aria = ((await publish.getAttribute("aria-label")) || "").trim();
+    const text = ((await publish.innerText().catch(() => "")) || "").trim();
+    const accessible = aria || text.split("\n")[0].trim();
+    if (isPaidListingControl(accessible)) {
+      throw new Error(
+        `Refusing to click "${accessible}" because it is a Boost, promote, or other paid option. Nothing was published.`
+      );
+    }
+    await publish.click({ timeout: 10000 });
+    await page.waitForTimeout(5000);
+    return page.url();
+  } catch (err) {
+    if (hasDebugScreenshotNote(err)) throw err;
+    return throwListingFailure(page, err);
   }
-  const aria = ((await publish.getAttribute("aria-label")) || "").trim();
-  const text = ((await publish.innerText().catch(() => "")) || "").trim();
-  const accessible = aria || text.split("\n")[0].trim();
-  if (isPaidListingControl(accessible)) {
-    throw new Error(
-      `Refusing to click "${accessible}" because it is a Boost, promote, or other paid option. Nothing was published.`
-    );
-  }
-  await publish.click({ timeout: 10000 });
-  await page.waitForTimeout(5000);
-  return page.url();
 }
 
 export interface MyListing {
