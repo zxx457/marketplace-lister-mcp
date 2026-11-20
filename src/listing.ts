@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { Locator, Page } from "playwright";
-import { getPage } from "./browser.js";
+import { getPage, profileDir } from "./browser.js";
 
 const CREATE_URL = "https://www.facebook.com/marketplace/create/item";
 const SELLING_URL = "https://www.facebook.com/marketplace/you/selling";
@@ -167,43 +167,171 @@ async function gotoCreate(page: Page): Promise<void> {
   );
 }
 
+/** Added pauses stay under ~45s for a 7-photo listing: 6 photo gaps × ≤2s + 8 step gaps × ≤1.2s. */
+const STEP_PAUSE_MIN_MS = 400;
+const STEP_PAUSE_MAX_MS = 1200;
+const PHOTO_PAUSE_MIN_MS = 800;
+const PHOTO_PAUSE_MAX_MS = 2000;
+const PER_PHOTO_WAIT_MS = 15000;
+const UPLOAD_SETTLE_MS = 20000;
+/** Initial fill plus this many full reloads when the create form itself crashes. */
+const MAX_FORM_RETRIES = 2;
+const FILE_INPUT = 'input[type=file][accept*="image"]';
+const DIALOG_SELECTOR = '[role="dialog"][aria-modal="true"], [role="alertdialog"]';
+const CLOSE_BUTTON =
+  '[aria-label="Close"], [aria-label="close"], [role="button"]:has-text("Close"), div[role="button"]:has-text("Close")';
+const OOPS_RE = /oops|something went wrong|you may be able to try again/i;
+
 /**
- * Close Facebook error/blocking modals that sit on top of the create form.
- *
- * A failed or flaky photo upload often raises an "Oops / Something went wrong"
- * dialog. Its __fb-light-mode backdrop keeps receiving pointer events, so later
- * clicks (especially Category) time out even though the combobox is visible.
- * Only these error dialogs are dismissed; category dropdowns and paid/Boost
- * controls are left alone. Clicks are real UI clicks, never force:true.
+ * Set once an Oops dialog has been seen on this page during the current fill.
+ * A later blank composer is treated as a crash even after the dialog is gone.
  */
-async function dismissBlockingDialogs(page: Page): Promise<string[]> {
-  const dismissed: string[] = [];
-  const dialogs = page.locator('[role="dialog"][aria-modal="true"], [role="alertdialog"]');
-  const count = await dialogs.count();
-  for (let i = 0; i < count; i++) {
-    const dialog = dialogs.nth(i);
-    if (!(await dialog.isVisible().catch(() => false))) continue;
-    const label = ((await dialog.getAttribute("aria-label")) || "").trim();
-    const text = ((await dialog.innerText().catch(() => "")) || "").replace(/\s+/g, " ").trim();
-    const blob = `${label} ${text}`;
-    if (!/oops|something went wrong|you may be able to try again/i.test(blob)) continue;
-    const close = dialog
-      .locator(
-        '[aria-label="Close"], [aria-label="close"], [role="button"]:has-text("Close"), div[role="button"]:has-text("Close")'
-      )
-      .first();
-    if ((await close.count()) === 0) {
-      await page.keyboard.press("Escape");
-    } else {
-      await close.click({ timeout: 5000 });
-    }
-    await dialog.waitFor({ state: "hidden", timeout: 8000 }).catch(() => {});
-    dismissed.push(label || text.slice(0, 80));
+const oopsSeenOnPage = new WeakMap<Page, boolean>();
+
+class FormCrashedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "FormCrashedError";
   }
-  return dismissed;
 }
 
-/** How many photos the create form currently shows as attached. */
+function randMs(min: number, max: number): number {
+  return min + Math.floor(Math.random() * (max - min + 1));
+}
+
+async function pause(page: Page, min: number, max: number): Promise<void> {
+  await page.waitForTimeout(randMs(min, max));
+}
+
+interface OopsHit {
+  index: number;
+  label: string;
+}
+
+/** Visible Oops / "Something went wrong" dialogs only. Category menus and Boost are ignored. */
+async function findOopsDialogs(page: Page): Promise<OopsHit[]> {
+  const dialogs = page.locator(DIALOG_SELECTOR);
+  const count = await dialogs.count().catch(() => 0);
+  const hits: OopsHit[] = [];
+  for (let i = 0; i < count; i++) {
+    try {
+      const dialog = dialogs.nth(i);
+      if (!(await dialog.isVisible().catch(() => false))) continue;
+      const label = ((await dialog.getAttribute("aria-label")) || "").trim();
+      const text = ((await dialog.innerText().catch(() => "")) || "").replace(/\s+/g, " ").trim();
+      if (!OOPS_RE.test(`${label} ${text}`)) continue;
+      hits.push({ index: i, label: label || text.slice(0, 80) || "Oops" });
+    } catch {
+      /* dialog detached while it was being read */
+    }
+  }
+  return hits;
+}
+
+/**
+ * Close an Oops dialog without ever throwing.
+ *
+ * Escape first. Then click Close with force, because a child `__fb-light-mode`
+ * subtree intercepts ordinary pointer events and a normal click times out.
+ * Then dispatch a DOM click on that same Close button. Short timeouts; every
+ * failure is swallowed. Returns whether no Oops dialog is still open.
+ */
+async function dismissBlockingDialogs(page: Page): Promise<{ gone: boolean; labels: string[] }> {
+  const labels: string[] = [];
+  const remember = (hits: OopsHit[]) => {
+    for (const hit of hits) {
+      if (!labels.includes(hit.label)) labels.push(hit.label);
+    }
+  };
+  try {
+    for (let round = 0; round < 3; round++) {
+      const hits = await findOopsDialogs(page);
+      if (hits.length === 0) return { gone: true, labels };
+      remember(hits);
+
+      await page.keyboard.press("Escape").catch(() => {});
+      await page.waitForTimeout(250).catch(() => {});
+      if ((await findOopsDialogs(page)).length === 0) return { gone: true, labels };
+
+      const dialogs = page.locator(DIALOG_SELECTOR);
+      for (const hit of await findOopsDialogs(page)) {
+        const close = dialogs.nth(hit.index).locator(CLOSE_BUTTON).first();
+        if ((await close.count().catch(() => 0)) === 0) continue;
+        await close.click({ force: true, timeout: 1500 }).catch(() => {});
+      }
+      await page.waitForTimeout(250).catch(() => {});
+      if ((await findOopsDialogs(page)).length === 0) return { gone: true, labels };
+
+      const dialogsAgain = page.locator(DIALOG_SELECTOR);
+      for (const hit of await findOopsDialogs(page)) {
+        const close = dialogsAgain.nth(hit.index).locator(CLOSE_BUTTON).first();
+        if ((await close.count().catch(() => 0)) === 0) continue;
+        // Cast is type-only: SVGElement has no click() in the DOM types. Emitted code is el.click().
+        await close.evaluate((el) => {
+          (el as HTMLElement).click();
+        }).catch(() => {});
+      }
+      await page.waitForTimeout(250).catch(() => {});
+      if ((await findOopsDialogs(page)).length === 0) return { gone: true, labels };
+    }
+  } catch {
+    /* dismissal must never throw */
+  }
+  try {
+    return { gone: (await findOopsDialogs(page)).length === 0, labels };
+  } catch {
+    return { gone: false, labels };
+  }
+}
+
+/**
+ * The composer is still on the page when its fields are attached.
+ *
+ * A crashed create page is blank: the title input, the photo file input, and
+ * the category comboboxes are gone, not merely covered. File inputs are often
+ * hidden even on a healthy form, so attachment counts rather than visibility.
+ * The audience step drops those fields on purpose and is not a crash.
+ */
+async function createFormPresent(page: Page): Promise<boolean> {
+  try {
+    const url = page.url();
+    if (!url.includes("/marketplace/create/item")) return false;
+    if ((await page.locator('label:has-text("Title") input').count().catch(() => 0)) > 0) return true;
+    if ((await page.locator(FILE_INPUT).count().catch(() => 0)) > 0) return true;
+    if ((await page.locator("label[role=combobox]").count().catch(() => 0)) > 0) return true;
+    // The audience step replaces those fields on purpose. A blank crash does not.
+    if (url.includes("step=audience")) return true;
+    const text = await page.locator("body").innerText().catch(() => "");
+    return /list in more places/i.test(text);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Dismiss Oops, then if one was seen and the composer is gone, ask the caller
+ * to reload. This throw is the crash signal; the dismissal itself does not throw.
+ */
+async function dismissOrCrash(page: Page): Promise<string[]> {
+  const result = await dismissBlockingDialogs(page);
+  if (result.labels.length) oopsSeenOnPage.set(page, true);
+  if (!oopsSeenOnPage.get(page)) return result.labels;
+  if (!(await createFormPresent(page))) {
+    const which = result.labels.length ? ` (${result.labels.join("; ")})` : "";
+    throw new FormCrashedError(
+      `Facebook showed an error dialog${which} and the create form is blank (now at ${page.url()}).`
+    );
+  }
+  return result.labels;
+}
+
+/** Pause between form steps, and bail out first if the composer has crashed. */
+async function betweenSteps(page: Page): Promise<void> {
+  await dismissOrCrash(page);
+  await pause(page, STEP_PAUSE_MIN_MS, STEP_PAUSE_MAX_MS);
+}
+
+/** How many photos the create form currently shows as attached, from its own counter. */
 async function attachedPhotoCount(page: Page): Promise<number> {
   const text = ((await page.locator("body").innerText().catch(() => "")) || "").replace(/\s+/g, " ");
   const slash = text.match(/Photos\s*[·•]\s*(\d+)\s*\/\s*\d+/i);
@@ -214,33 +342,199 @@ async function attachedPhotoCount(page: Page): Promise<number> {
 }
 
 /**
- * Attach photos and wait until the form shows them. If Facebook raises the
- * Oops modal (upload failed, 0 attached), close it and retry a few times
- * instead of continuing on to Category, which would then be unclickable.
+ * Thumbnail count inside the photo area, plus whether a small upload spinner
+ * is still showing there. Page-level skeletons are ignored: a spinner only
+ * counts when it is thumbnail-sized and sits in the photo section.
+ */
+async function photoAreaState(page: Page): Promise<{ count: number; busy: boolean }> {
+  const dom = await page
+    .evaluate(() => {
+      const input = document.querySelector('input[type="file"]');
+      let el: HTMLElement | null = input instanceof HTMLElement ? input.parentElement : null;
+      let root: HTMLElement | null = el;
+      for (let i = 0; i < 12 && el; i++) {
+        const text = el.innerText || "";
+        if (/photo/i.test(text) && text.length < 4000) root = el;
+        if (text.length > 5000) break;
+        el = el.parentElement;
+      }
+      if (!root) return { count: 0, busy: false };
+
+      const boxOf = (node: Element) => (node as HTMLElement).getBoundingClientRect();
+      const shown = (node: Element) => {
+        const box = boxOf(node);
+        if (box.width < 2 || box.height < 2) return false;
+        const style = getComputedStyle(node);
+        return style.visibility !== "hidden" && style.display !== "none" && style.opacity !== "0";
+      };
+      const thumbSized = (node: Element) => {
+        const box = boxOf(node);
+        return box.width >= 48 && box.height >= 48 && box.width <= 280 && box.height <= 280;
+      };
+      const spinnerSized = (node: Element) => {
+        const box = boxOf(node);
+        return box.width <= 240 && box.height <= 240;
+      };
+
+      let images = 0;
+      for (const img of root.querySelectorAll("img")) {
+        if (!shown(img) || !thumbSized(img)) continue;
+        const src = img.getAttribute("src") || "";
+        if (src.startsWith("blob:") || src.startsWith("data:image")) images++;
+      }
+      let backgrounds = 0;
+      for (const node of root.querySelectorAll("div")) {
+        if (!shown(node) || !thumbSized(node)) continue;
+        const bg = getComputedStyle(node).backgroundImage || "";
+        if (bg.includes("blob:") || bg.includes("data:image")) backgrounds++;
+      }
+      let removes = 0;
+      for (const node of root.querySelectorAll("[aria-label]")) {
+        const label = (node.getAttribute("aria-label") || "").trim();
+        if (!/^remove$/i.test(label) && !/^remove photo\b/i.test(label)) continue;
+        if (shown(node)) removes++;
+      }
+
+      let busy = false;
+      for (const node of root.querySelectorAll('[role="progressbar"], [aria-busy="true"]')) {
+        if (shown(node) && spinnerSized(node)) {
+          busy = true;
+          break;
+        }
+      }
+      if (!busy) {
+        for (const node of root.querySelectorAll("[aria-label]")) {
+          const label = node.getAttribute("aria-label") || "";
+          if (!/uploading|\bloading\b/i.test(label)) continue;
+          if (shown(node) && spinnerSized(node)) {
+            busy = true;
+            break;
+          }
+        }
+      }
+      if (!busy && /\buploading\b/i.test(root.innerText || "")) busy = true;
+      // One photo often has both a blob image and a background, so don't add them.
+      // A remove control is one per thumbnail once it exists.
+      const count = removes > 0 ? removes : images > 0 ? images : backgrounds;
+      return { count, busy };
+    })
+    .catch(() => ({ count: 0, busy: false }));
+
+  const textCount = await attachedPhotoCount(page);
+  return { count: Math.max(textCount, dom.count), busy: dom.busy };
+}
+
+async function thumbnailCount(page: Page): Promise<number> {
+  return (await photoAreaState(page)).count;
+}
+
+/** Wait until a new thumbnail appears, or until the bounded timeout. Never throws for a slow preview. */
+async function waitForNewThumbnail(
+  page: Page,
+  before: number,
+  timeoutMs: number,
+  onDialog: (labels: string[]) => void
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const labels = await dismissOrCrash(page);
+    if (labels.length) onDialog(labels);
+    if ((await thumbnailCount(page)) > before) return true;
+    await page.waitForTimeout(400);
+  }
+  return (await thumbnailCount(page)) > before;
+}
+
+/**
+ * Attach photos one at a time.
+ *
+ * Hypothesis, not a confirmed cause: setting every file on the input at once
+ * and immediately moving on is what makes the composer throw "Oops" over a
+ * blank page. A single file is set per call, the file input is re-queried
+ * each time, and the next photo waits until a new thumbnail appears (or a
+ * bounded timeout) plus a short pause. Other fields are not touched until
+ * the thumbnails are all present and no upload spinner is showing, or until
+ * that settle wait ends. A spinner still visible after the wait does not
+ * fail the listing once every thumbnail is there.
  */
 async function uploadPhotos(page: Page, photos: string[]): Promise<void> {
-  const fileInput = 'input[type=file][accept*="image"]';
-  let lastDialog = "";
-  for (let attempt = 0; attempt < 3; attempt++) {
-    await dismissBlockingDialogs(page);
-    await page.setInputFiles(fileInput, photos, { timeout: 20000 });
-    const deadline = Date.now() + 20000;
-    while (Date.now() < deadline) {
-      const dismissed = await dismissBlockingDialogs(page);
-      if (dismissed.length) {
-        lastDialog = dismissed.join("; ");
-        break;
+  const dialogs = { last: "" };
+  const note = (labels: string[]) => {
+    if (labels.length) dialogs.last = labels.join("; ");
+  };
+
+  for (let i = 0; i < photos.length; i++) {
+    const photo = photos[i];
+    const before = await thumbnailCount(page);
+
+    const send = async (): Promise<boolean> => {
+      note(await dismissOrCrash(page));
+      const input = page.locator(FILE_INPUT).first();
+      if ((await input.count().catch(() => 0)) === 0) {
+        if (!(await createFormPresent(page))) {
+          throw new FormCrashedError(
+            `The create form went blank before photo ${i + 1} of ${photos.length} (${path.basename(photo)}) at ${page.url()}.`
+          );
+        }
+        throw new Error(`Could not find the photo file input on the create form (now at ${page.url()}).`);
       }
-      if ((await attachedPhotoCount(page)) >= photos.length) return;
-      await page.waitForTimeout(500);
+      let oops = false;
+      try {
+        await input.setInputFiles([photo], { timeout: 15000 });
+      } catch (err) {
+        if (err instanceof FormCrashedError) throw err;
+        const labels = await dismissOrCrash(page);
+        note(labels);
+        if (labels.length) oops = true;
+        if (!(await createFormPresent(page))) {
+          throw new FormCrashedError(
+            `The create form went blank while attaching photo ${i + 1} of ${photos.length} (${path.basename(photo)}) at ${page.url()}.`
+          );
+        }
+      }
+      return oops;
+    };
+
+    let sawOops = await send();
+    const incremented = await waitForNewThumbnail(page, before, PER_PHOTO_WAIT_MS, (labels) => {
+      note(labels);
+      if (labels.length) sawOops = true;
+    });
+
+    // One more try only when Facebook showed Oops and this photo never appeared.
+    // A slow preview is not sent twice, or the listing would gain a duplicate.
+    if (!incremented && sawOops && (await thumbnailCount(page)) <= before) {
+      await pause(page, PHOTO_PAUSE_MIN_MS, PHOTO_PAUSE_MAX_MS);
+      await send();
+      await waitForNewThumbnail(page, before, PER_PHOTO_WAIT_MS, note);
     }
-    if ((await attachedPhotoCount(page)) >= photos.length) return;
-    await page.waitForTimeout(1500 + attempt * 1500);
+
+    if ((await thumbnailCount(page)) <= before && !(await createFormPresent(page))) {
+      throw new FormCrashedError(
+        `The create form went blank while uploading photo ${i + 1} of ${photos.length} (${path.basename(photo)}) at ${page.url()}.`
+      );
+    }
+
+    if (i < photos.length - 1) await pause(page, PHOTO_PAUSE_MIN_MS, PHOTO_PAUSE_MAX_MS);
   }
-  const got = await attachedPhotoCount(page);
+
+  const deadline = Date.now() + UPLOAD_SETTLE_MS;
+  while (Date.now() < deadline) {
+    note(await dismissOrCrash(page));
+    const state = await photoAreaState(page);
+    if (state.count >= photos.length && !state.busy) return;
+    await page.waitForTimeout(400);
+  }
+  const state = await photoAreaState(page);
+  if (state.count >= photos.length) return;
+  if (!(await createFormPresent(page))) {
+    throw new FormCrashedError(
+      `The create form went blank after attaching photos (got ${state.count} of ${photos.length}) at ${page.url()}.`
+    );
+  }
   throw new Error(
-    `Photos did not attach to the create form (got ${got} of ${photos.length}` +
-      (lastDialog ? ` after Facebook showed: ${lastDialog}` : "") +
+    `Photos did not finish uploading (got ${state.count} of ${photos.length}` +
+      (dialogs.last ? ` after Facebook showed: ${dialogs.last}` : "") +
       "). Nothing was published."
   );
 }
@@ -256,12 +550,17 @@ async function uploadPhotos(page: Page, photos: string[]): Promise<void> {
  */
 async function pickFromCombobox(page: Page, comboLabel: string, optionText: string): Promise<void> {
   const combo = `label[role=combobox]:has-text("${comboLabel}")`;
-  await dismissBlockingDialogs(page);
+  await dismissOrCrash(page);
   try {
     await page.click(combo, { timeout: 8000 });
   } catch (err) {
     // Overlay may have appeared after the first dismiss; close and try once more.
-    await dismissBlockingDialogs(page);
+    await dismissOrCrash(page);
+    if (!(await createFormPresent(page))) {
+      throw new FormCrashedError(
+        `The create form went blank before ${comboLabel} could be set (now at ${page.url()}).`
+      );
+    }
     try {
       await page.click(combo, { timeout: 8000 });
     } catch {
@@ -1173,35 +1472,44 @@ async function clickFormButton(page: Page, label: "Next" | "Publish"): Promise<v
 }
 
 /**
- * Fill the whole create form and advance to the review ("List in more places")
- * step. Deliberately STOPS before Publish so the caller can confirm.
- * Returns a PNG screenshot buffer of the review page.
- *
- * Optional location, hide-from-friends, product tags, and group sharing run
- * only when those fields are passed. Boost / promote / paid controls are never
- * clicked.
+ * PNG written when a crashed create form does not recover. There was no
+ * on-disk debug screenshot before this; the review image is only returned to
+ * the tool caller. The file lives beside the Facebook profile directory.
  */
-export async function fillListing(input: ListingInput): Promise<ListingDraft> {
-  for (const p of input.photos) {
-    if (!fs.existsSync(p)) throw new Error(`Photo not found: ${p}`);
+async function saveDebugScreenshot(page: Page): Promise<string> {
+  try {
+    const dir = path.join(path.dirname(profileDir()), "debug");
+    fs.mkdirSync(dir, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const file = path.join(dir, `create-form-${stamp}.png`);
+    await page.screenshot({ path: file });
+    return file;
+  } catch {
+    return "";
   }
-  const page = await getPage();
-  await gotoCreate(page);
-  await page.waitForTimeout(2500);
+}
 
+/**
+ * Fill the create form once and stop on the review step. Does not publish.
+ * Photos, then each field, are separated by a short randomized pause.
+ */
+async function fillCreateForm(page: Page, input: ListingInput): Promise<ListingDraft> {
   await uploadPhotos(page, input.photos);
-  await dismissBlockingDialogs(page);
 
+  await betweenSteps(page);
   await page.fill('label:has-text("Title") input', input.title, { timeout: 10000 });
+  await betweenSteps(page);
   await page.fill('label:has-text("Price") input', String(input.price), { timeout: 10000 });
-  await dismissBlockingDialogs(page);
 
   // Category (and Condition) come before Description. On the current form the
   // textarea is inside collapsed More details and may not exist until a category is chosen.
+  await betweenSteps(page);
   await pickFromCombobox(page, "Category", input.category);
+  await betweenSteps(page);
   await pickFromCombobox(page, "Condition", input.condition);
 
   const state: FormState = { moreDetailsHandled: false, moreDetailsMissing: false };
+  await betweenSteps(page);
   await fillDescription(page, state, input.description);
   const tagsRequested = (input.productTags ?? []).some((tag) => tag.trim());
   const draft: ListingDraft = {
@@ -1223,8 +1531,12 @@ export async function fillListing(input: ListingInput): Promise<ListingDraft> {
     if (needsLocation || needsTags || needsHide) await ensureMoreDetails(page, state);
   }
 
-  if (input.location !== undefined) draft.location = await setLocation(page, state, input.location);
+  if (input.location !== undefined) {
+    await betweenSteps(page);
+    draft.location = await setLocation(page, state, input.location);
+  }
   if (tagsRequested && input.productTags) {
+    await betweenSteps(page);
     const tags = await addProductTags(page, state, input.productTags);
     draft.tagsAdded = tags.added;
     draft.tagsNotAdded = tags.notAdded;
@@ -1233,8 +1545,8 @@ export async function fillListing(input: ListingInput): Promise<ListingDraft> {
     draft.hideFromFriends = await setHideFromFriends(page, state, input.hideFromFriends);
   }
 
-  // Advance to the audience / review step.
-  await dismissBlockingDialogs(page);
+  // Advance to the audience / review step. Publish is a separate call.
+  await betweenSteps(page);
   await clickFormButton(page, "Next");
   await page.waitForTimeout(2500);
 
@@ -1247,6 +1559,54 @@ export async function fillListing(input: ListingInput): Promise<ListingDraft> {
 
   draft.screenshot = await page.screenshot();
   return draft;
+}
+
+/**
+ * Fill the whole create form and advance to the review ("List in more places")
+ * step. Deliberately STOPS before Publish so the caller can confirm.
+ * Returns a PNG screenshot buffer of the review page.
+ *
+ * Optional location, hide-from-friends, product tags, and group sharing run
+ * only when those fields are passed. Boost / promote / paid controls are never
+ * clicked.
+ *
+ * If an Oops dialog leaves the create form blank, the create page is loaded
+ * again and the fill starts over. That happens at most twice. Those retries
+ * do not publish.
+ */
+export async function fillListing(input: ListingInput): Promise<ListingDraft> {
+  for (const p of input.photos) {
+    if (!fs.existsSync(p)) throw new Error(`Photo not found: ${p}`);
+  }
+  let page = await getPage();
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= MAX_FORM_RETRIES; attempt++) {
+    page = await getPage();
+    if (attempt > 0) {
+      // Longer than the 400–1200ms step pauses: ~8s, then ~16s, plus a little jitter.
+      const backoff = (attempt === 1 ? 8000 : 16000) + randMs(0, 2000);
+      await page.waitForTimeout(backoff);
+    }
+    oopsSeenOnPage.set(page, false);
+    try {
+      await gotoCreate(page);
+      await page.waitForTimeout(2500);
+      return await fillCreateForm(page, input);
+    } catch (err) {
+      lastError = err;
+      if (err instanceof FormCrashedError && attempt < MAX_FORM_RETRIES) continue;
+      break;
+    }
+  }
+  if (lastError instanceof FormCrashedError) {
+    const shot = await saveDebugScreenshot(page);
+    throw new Error(
+      `The create form crashed and did not recover after ${MAX_FORM_RETRIES} full retries. ` +
+        `${lastError.message} Nothing was published.` +
+        (shot ? ` Debug screenshot: ${shot}` : " A debug screenshot could not be saved.")
+    );
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
 /**
