@@ -114,6 +114,7 @@ This is the fastest way to clear out a room: photograph, price, approve, next.
 - The first photo of each item becomes the cover photo, so lead with the clearest full view.
 - **Posting from a folder you've used before?** Ask Claude to check what you already have listed first. It can read your Selling page, and photos tend to linger in a folder long after the thing sold.
 - New listings often say "being reviewed" for a few minutes before going live. That's Facebook, not a problem.
+- **Posts take 1-4 minutes.** Set the client tool timeout, `toolTimeoutSec`, to about 600 before posting. The default of 60 seconds cancels the call while the form is still being filled. Never retry a timed-out call. The first attempt may still be publishing, and a second call lists the same item twice. Check your selling page first. A repeat of the same title and price is refused for 6 hours when a post is in progress, already published, or was left unconfirmed. `allow_duplicate` is only for intentionally listing a second copy.
 - If Facebook shows a security check or CAPTCHA, finish it yourself in the window. Claude won't try to get around it.
 - If a browser window won't open, install Google Chrome, or run `npx playwright install chromium` once.
 
@@ -133,13 +134,13 @@ For the curious. You never call these by name; Claude picks them.
 | `fb_login_status` | Says whether you're currently signed in. |
 | `scan_items` | Reads a folder. Subfolders are treated as ready-made items; loose photos come back individually for Claude to group by looking at them. |
 | `search_comps` | Looks up what similar items are listed for nearby and reports the price range. Reference only; it never recommends a price. |
-| `post_listing` | Uploads the photos, fills the form, checks the page really shows your title and price, and publishes. Runs only after you've approved the wording. Optionally sets location, hide-from-friends, product tags, and which groups to share to. |
+| `post_listing` | Uploads the photos, fills the form, checks the page really shows your title and price, and publishes with one Publish click. Posts take 1-4 minutes; set `toolTimeoutSec` to about 600. Never retry a timed-out call. Runs only after you've approved the wording. Optionally sets location, hide-from-friends, product tags, which groups to share to, and `allow_duplicate`. |
 | `create_listing` | Fills the form and stops at the preview instead of posting, if you'd rather see the page first. Takes the same optional location, hide-from-friends, tag, and group fields. |
 | `publish_listing` | Publishes a listing left at the preview by `create_listing`. |
 | `list_my_listings` | Shows your current listings and whether they're live yet. |
 
 `location`, `hide_from_friends`, `product_tags`, and `share_to_groups` are optional on `post_listing` and `create_listing`. Leave them out and the form is filled as before. Paid Boost or promote controls are never clicked.
 
-Settings, if you ever need them: `FB_MCP_PROFILE_DIR` moves where the dedicated login is stored, `FB_MCP_CHANNEL` picks a specific browser (`chrome` or `msedge`).
+Settings, if you ever need them: `FB_MCP_PROFILE_DIR` moves where the dedicated login is stored, `FB_MCP_CHANNEL` picks a specific browser (`chrome` or `msedge`). `FB_MCP_DUPLICATE_WINDOW_MS` is how long the same title and price stay reserved after a publish attempt (default 6 hours). A failed attempt does not reserve them; one that is still running, published, or unconfirmed does. `FB_MCP_PUBLISH_CONFIRM_MS` is how long to wait, after the single Publish click, for the page to leave the create flow (default 90 seconds). When that wait runs out the click is not repeated.
 
-To post from the Chrome you already use, instead of a second Facebook session, start that Chrome with remote debugging and set `FB_MCP_CDP_URL` to its address (for example `http://127.0.0.1:9230`) on the marketplace-lister process. The lister opens a tab in that window and leaves the rest of the window alone. Leave the variable unset and it launches its own profile, as before.
+To post from the Chrome you already use, instead of a second Facebook session, start that Chrome with remote debugging and set `FB_MCP_CDP_URL` to its address (for example `http://127.0.0.1:9230`) on the marketplace-lister process. The lister opens a tab in that window and, once a listing is confirmed, closes only that tab. Leave the variable unset and it launches its own profile, as before. The publish journal, `publish-journal.json`, is stored beside the profile directory so every lister process attached to that profile sees the same claims.
