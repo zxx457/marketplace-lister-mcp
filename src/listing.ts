@@ -167,13 +167,25 @@ async function gotoCreate(page: Page): Promise<void> {
   );
 }
 
+/**
+ * Live waits. The offline fixture test shortens the photo ones with
+ * FB_MCP_PHOTO_WAIT_MS, FB_MCP_UPLOAD_SETTLE_MS, FB_MCP_PHOTO_PAUSE_MIN_MS,
+ * and FB_MCP_PHOTO_PAUSE_MAX_MS. Unset, these stay the live values.
+ */
+function configuredMs(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw == null || raw === "") return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
 /** Added pauses stay under ~45s for a 7-photo listing: 6 photo gaps × ≤2s + 8 step gaps × ≤1.2s. */
 const STEP_PAUSE_MIN_MS = 400;
 const STEP_PAUSE_MAX_MS = 1200;
-const PHOTO_PAUSE_MIN_MS = 800;
-const PHOTO_PAUSE_MAX_MS = 2000;
-const PER_PHOTO_WAIT_MS = 15000;
-const UPLOAD_SETTLE_MS = 20000;
+const PHOTO_PAUSE_MIN_MS = configuredMs("FB_MCP_PHOTO_PAUSE_MIN_MS", 800);
+const PHOTO_PAUSE_MAX_MS = configuredMs("FB_MCP_PHOTO_PAUSE_MAX_MS", 2000);
+const PER_PHOTO_WAIT_MS = configuredMs("FB_MCP_PHOTO_WAIT_MS", 15000);
+const UPLOAD_SETTLE_MS = configuredMs("FB_MCP_UPLOAD_SETTLE_MS", 20000);
 /**
  * Initial fill plus this many full reloads when the create form crashes, or
  * when an Oops dialog leaves none or only some of the photos attached.
