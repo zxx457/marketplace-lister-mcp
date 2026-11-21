@@ -26,12 +26,53 @@ const CHANNEL = process.env.FB_MCP_CHANNEL; // e.g. "chrome" | "msedge"
 
 let ctx: BrowserContext | null = null;
 
+/**
+ * Chrome shows "Restore pages? Chrome didn't shut down correctly" when the
+ * previous process was killed. That bubble sits on top of the create form.
+ * exit_type "Crashed" and exited_cleanly false are what trigger it; a clean
+ * exit is written before launch. --hide-crash-restore-bubble covers a profile
+ * Chrome rewrites as crashed while it is starting.
+ */
+export function suppressCrashedSession(userDataDir: string): void {
+  const files = [path.join(userDataDir, "Default", "Preferences"), path.join(userDataDir, "Preferences")];
+  for (const preferencesPath of files) {
+    if (!fs.existsSync(preferencesPath)) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(fs.readFileSync(preferencesPath, "utf8"));
+    } catch {
+      continue;
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) continue;
+    const root = parsed as Record<string, unknown>;
+    const current = root.profile;
+    const profile: Record<string, unknown> =
+      current && typeof current === "object" && !Array.isArray(current) ? { ...(current as Record<string, unknown>) } : {};
+    if (profile.exit_type === "Normal" && profile.exited_cleanly === true) continue;
+    profile.exit_type = "Normal";
+    profile.exited_cleanly = true;
+    root.profile = profile;
+    const tmp = `${preferencesPath}.${process.pid}.tmp`;
+    try {
+      const mode = fs.statSync(preferencesPath).mode;
+      fs.writeFileSync(tmp, JSON.stringify(root), { mode });
+      fs.renameSync(tmp, preferencesPath);
+    } catch {
+      try {
+        fs.unlinkSync(tmp);
+      } catch {
+        /* the original Preferences file is left as it was */
+      }
+    }
+  }
+}
+
 async function launch(channel?: string): Promise<BrowserContext> {
   return chromium.launchPersistentContext(PROFILE_DIR, {
     headless: false,
     channel,
     viewport: null,
-    args: ["--disable-blink-features=AutomationControlled"],
+    args: ["--disable-blink-features=AutomationControlled", "--hide-crash-restore-bubble"],
   });
 }
 
@@ -55,6 +96,9 @@ export async function getContext(): Promise<BrowserContext> {
     ctx = null;
   }
   fs.mkdirSync(PROFILE_DIR, { recursive: true });
+  // A killed Chrome leaves exit_type "Crashed". Clear that before the new
+  // process starts, or the restore-session bubble covers the create form.
+  suppressCrashedSession(PROFILE_DIR);
   // Prefer an installed browser: nearly everyone has one, and it keeps install
   // fast by not requiring Playwright's ~150 MB Chromium download. Bundled
   // Chromium is the last resort, and some Windows setups can't spawn it at all
