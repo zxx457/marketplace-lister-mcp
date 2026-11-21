@@ -1,4 +1,4 @@
-import { getContext, getPage, isLoggedIn } from "./browser.js";
+import { cdpEndpoint, getContext, getPage, isLoggedIn, usingExistingBrowser } from "./browser.js";
 
 export interface LoginResult {
   status: "already_logged_in" | "logged_in" | "pending";
@@ -33,6 +33,27 @@ async function readAccountName(): Promise<string | undefined> {
  *   Facebook's own page, only once — the session then persists in the profile.
  */
 export async function smoothLogin(waitMs = 45000): Promise<LoginResult> {
+  if (usingExistingBrowser()) {
+    // The Facebook session is the one already in the user's Chrome. Opening a
+    // login page here would be that same session, but a missing cookie should
+    // be fixed by the user in their own window, not by a second browser.
+    await getContext();
+    const endpoint = cdpEndpoint();
+    if (await isLoggedIn()) {
+      return {
+        status: "already_logged_in",
+        account: await readAccountName(),
+        message: `Already signed in in the attached Chrome (${endpoint}). The lister uses that window and does not open a second Facebook session.`,
+      };
+    }
+    return {
+      status: "pending",
+      message:
+        `The lister is attached to the Chrome at ${endpoint} and will not start its own browser or a second Facebook session. ` +
+        `Sign in to Facebook in that window, then call fb_login again.`,
+    };
+  }
+
   await getContext(); // launches the window
   const page = await getPage();
 

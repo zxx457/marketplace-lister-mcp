@@ -1,0 +1,95 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Marketplace create item</title>
+  <style>
+    body { font-family: sans-serif; margin: 24px; }
+    #oops {
+      display: none;
+      position: fixed;
+      top: 24px;
+      left: 24px;
+      width: 420px;
+      padding: 16px;
+      background: #fff;
+      border: 1px solid #ccc;
+      z-index: 5;
+    }
+    #oops.open { display: block; }
+    #close { position: relative; z-index: 1; width: 96px; height: 40px; }
+    /* Sibling painted over Close. A normal click hits this instead of the button. */
+    #cover { position: absolute; inset: 0; z-index: 2; background: transparent; }
+    #cover.off { display: none; }
+    #next[disabled] { opacity: 0.4; }
+  </style>
+</head>
+<body>
+  <label>Title <input id="title" /></label>
+  <label role="combobox">Category</label>
+  <div id="photos">
+    <p>Photos · <span id="count">0</span>/10</p>
+    <p id="hint">Please upload at least one photo.</p>
+    <input id="file" type="file" accept="image/jpeg,image/png" multiple />
+  </div>
+  <div id="oops" role="alertdialog" aria-modal="true" aria-label="Oops">
+    <p>Oops, something went wrong. You may be able to try again.</p>
+    <div role="button" aria-label="Close" id="close">Close</div>
+    <div class="__fb-light-mode" id="cover"></div>
+  </div>
+  <div role="button" id="next" aria-disabled="true">Next</div>
+  <div role="button" id="publish">Publish</div>
+  <script>
+    window.__calls = [];
+    window.__published = false;
+    window.__closeClicks = 0;
+    window.__mode = "ok";
+    window.__ignoreEscape = false;
+
+    const file = document.getElementById("file");
+    const oops = document.getElementById("oops");
+    const cover = document.getElementById("cover");
+    const countEl = document.getElementById("count");
+
+    function syncCover() {
+      cover.classList.toggle("off", window.__mode !== "overlay");
+    }
+    function hideOops() {
+      oops.classList.remove("open");
+    }
+    function showOops() {
+      syncCover();
+      oops.classList.add("open");
+    }
+    window.__showOops = showOops;
+
+    function addThumbs(n) {
+      hideOops();
+      const next = Number(countEl.textContent) + n;
+      countEl.textContent = String(next);
+      document.getElementById("hint").textContent = next ? "" : "Please upload at least one photo.";
+      document.getElementById("next").setAttribute("aria-disabled", next ? "false" : "true");
+    }
+
+    file.addEventListener("change", () => {
+      const n = file.files ? file.files.length : 0;
+      window.__calls.push(n);
+      if (window.__mode === "ok") addThumbs(n);
+      else showOops();
+    });
+
+    document.getElementById("close").addEventListener("click", () => {
+      window.__closeClicks += 1;
+      hideOops();
+    });
+    document.addEventListener("keydown", (event) => {
+      if (event.key !== "Escape" || window.__ignoreEscape) return;
+      hideOops();
+    });
+    document.getElementById("publish").addEventListener("click", () => {
+      window.__published = true;
+    });
+    syncCover();
+  </script>
+</body>
+</html>
