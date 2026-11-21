@@ -1,7 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { Locator, Page } from "playwright";
-import { getPage, profileDir } from "./browser.js";
+import { closeListerTab, getPage, profileDir } from "./browser.js";
+import { claimPublish, publishConfirmMs, publishJournalPath, settlePublish } from "./publish-guard.js";
 
 const CREATE_URL = "https://www.facebook.com/marketplace/create/item";
 const SELLING_URL = "https://www.facebook.com/marketplace/you/selling";
@@ -1755,7 +1756,7 @@ async function fillCreateForm(page: Page, input: ListingInput, preferBatch = fal
  * call. Those retries do not publish. Whatever failure is given up on saves
  * a debug screenshot and includes its path in the error.
  */
-export async function fillListing(input: ListingInput): Promise<ListingDraft> {
+export async function fillListing(input: ListingInput, signal?: AbortSignal): Promise<ListingDraft> {
   for (const p of input.photos) {
     if (!fs.existsSync(p)) throw new Error(`Photo not found: ${p}`);
   }
@@ -1764,6 +1765,7 @@ export async function fillListing(input: ListingInput): Promise<ListingDraft> {
   let lastError: unknown;
   let failedAttempt = 0;
   for (let attempt = 0; attempt <= MAX_FORM_RETRIES; attempt++) {
+    if (signal?.aborted) throw new PublishCancelledError();
     try {
       page = await getPage();
       if (attempt > 0) {
@@ -1776,6 +1778,7 @@ export async function fillListing(input: ListingInput): Promise<ListingDraft> {
       await page.waitForTimeout(2500);
       return await fillCreateForm(page, input, preferBatch);
     } catch (err) {
+      if (err instanceof PublishCancelledError || signal?.aborted) throw new PublishCancelledError();
       lastError = err;
       failedAttempt = attempt;
       preferBatch = uploadModeAfterFailure(preferBatch, err);
@@ -1784,6 +1787,42 @@ export async function fillListing(input: ListingInput): Promise<ListingDraft> {
     }
   }
   return throwListingFailure(page, lastError, failurePrefix(lastError, failedAttempt));
+}
+
+/**
+ * The client gave up before Publish was clicked. Nothing was posted, so a
+ * later call is safe once the client waits long enough for a post to finish.
+ */
+export const CANCELLED_BEFORE_PUBLISH_MESSAGE =
+  "Nothing was published. The client cancelled before Publish was clicked. " +
+  "Posts take 1-4 minutes; set the client tool timeout (toolTimeoutSec) to about 600 seconds, then call post_listing again.";
+
+/** Publish was clicked once and the create flow never went away. Do not click again. */
+export const UNCONFIRMED_PUBLISH_MESSAGE = "unconfirmed — check list_my_listings, do not retry";
+
+export class PublishCancelledError extends Error {
+  constructor() {
+    super(CANCELLED_BEFORE_PUBLISH_MESSAGE);
+    this.name = "PublishCancelledError";
+  }
+}
+
+export type PublishOutcome =
+  | { status: "published"; url: string }
+  | { status: "unconfirmed"; url: string; message: string };
+
+export type PostListingResult =
+  | (ListingDraft & { outcome: "published"; url: string })
+  | (ListingDraft & { outcome: "unconfirmed"; url: string; message: string })
+  | { outcome: "cancelled"; message: string };
+
+export interface PostListingOptions {
+  /** MCP request signal. When it aborts before Publish, the click is skipped. */
+  signal?: AbortSignal;
+  /** Claim the title and price even when a recent post already reserved them. */
+  allowDuplicate?: boolean;
+  /** Defaults to publish-journal.json beside the profile directory. */
+  journalPath?: string;
 }
 
 /**
@@ -1797,43 +1836,96 @@ export async function fillListing(input: ListingInput): Promise<ListingDraft> {
  * The visual check the two-step flow bought is replaced by a stricter one. The
  * review page is read back and the title and price must appear on it before
  * anything is published, which catches a field that silently failed to fill.
+ *
+ * The title and price are claimed before the form is touched. A second call
+ * with the same pair, including one still in progress, is refused so a client
+ * that timed out and retried cannot list the item twice.
  */
-export async function postListing(input: ListingInput): Promise<ListingDraft & { url: string }> {
-  const draft = await fillListing(input);
+export async function postListing(input: ListingInput, options: PostListingOptions = {}): Promise<PostListingResult> {
+  const journalPath = options.journalPath ?? publishJournalPath(profileDir());
+  const claim = claimPublish(journalPath, input.title, input.price, options.allowDuplicate === true);
+  let settledStatus: "published" | "unconfirmed" | "failed" | null = null;
+  const finish = (status: "published" | "unconfirmed" | "failed", url?: string) => {
+    if (settledStatus) return;
+    settledStatus = status;
+    settlePublish(journalPath, claim, status, url);
+  };
+  try {
+    if (options.signal?.aborted) {
+      finish("failed");
+      return { outcome: "cancelled", message: CANCELLED_BEFORE_PUBLISH_MESSAGE };
+    }
 
-  const page = await getPage();
-  const review = await page.innerText("body");
-  const priceText = String(input.price).replace(/[^0-9.]/g, "");
-  // Facebook renders 1120 as "$1,120" on the review preview, so a raw
-  // includes("1120") misses a correctly filled price.
-  const reviewForPrice = review.replace(/,/g, "");
-  const missing: string[] = [];
-  if (!review.includes(input.title.slice(0, 40))) missing.push("title");
-  if (priceText && !review.includes(priceText) && !reviewForPrice.includes(priceText)) missing.push("price");
-  if (missing.length) {
-    await throwListingFailure(
-      page,
-      new Error(
-        `Stopping before publish: the review page does not show the ${missing.join(" or ")} that was asked for. ` +
-          `Nothing was posted. Check the form and try again.`
-      )
-    );
+    const draft = await fillListing(input, options.signal);
+    if (options.signal?.aborted) {
+      finish("failed");
+      return { outcome: "cancelled", message: CANCELLED_BEFORE_PUBLISH_MESSAGE };
+    }
+
+    const page = await getPage();
+    const review = await page.innerText("body");
+    const priceText = String(input.price).replace(/[^0-9.]/g, "");
+    // Facebook renders 1120 as "$1,120" on the review preview, so a raw
+    // includes("1120") misses a correctly filled price.
+    const reviewForPrice = review.replace(/,/g, "");
+    const missing: string[] = [];
+    if (!review.includes(input.title.slice(0, 40))) missing.push("title");
+    if (priceText && !review.includes(priceText) && !reviewForPrice.includes(priceText)) missing.push("price");
+    if (missing.length) {
+      await throwListingFailure(
+        page,
+        new Error(
+          `Stopping before publish: the review page does not show the ${missing.join(" or ")} that was asked for. ` +
+            `Nothing was posted. Check the form and try again.`
+        )
+      );
+    }
+
+    if (options.signal?.aborted) {
+      finish("failed");
+      return { outcome: "cancelled", message: CANCELLED_BEFORE_PUBLISH_MESSAGE };
+    }
+
+    const published = await publishPreparedDraft(page, options.signal);
+    finish(published.status, published.url);
+    if (published.status === "unconfirmed") {
+      return { ...draft, outcome: "unconfirmed", url: published.url, message: published.message };
+    }
+    return { ...draft, outcome: "published", url: published.url };
+  } catch (err) {
+    if (!settledStatus) {
+      try {
+        settledStatus = "failed";
+        settlePublish(journalPath, claim, "failed");
+      } catch {
+        /* the original failure is the one to report */
+      }
+    }
+    if (err instanceof PublishCancelledError) {
+      return { outcome: "cancelled", message: err.message };
+    }
+    throw err;
   }
+}
 
-  const url = await publishListing();
-  return { ...draft, url };
+function stillOnCreate(url: string): boolean {
+  return url.includes("/marketplace/create");
+}
+
+function pageUrl(page: Page): string {
+  try {
+    return page.url();
+  } catch {
+    return "";
+  }
 }
 
 /**
- * Click Publish on the review step. Returns the resulting URL.
- *
- * This only works while the draft from create_listing is still on screen, which
- * holds as long as the server keeps running: both calls share one browser. If
- * the browser has been restarted in between, the draft is gone, and a bare
- * selector timeout would not explain why. Say what happened instead.
+ * Click Publish once, then wait until the URL leaves the create flow.
+ * A click that does not navigate is unconfirmed: the button is not clicked again.
  */
-export async function publishListing(): Promise<string> {
-  const page = await getPage();
+export async function publishPreparedDraft(page: Page, signal?: AbortSignal): Promise<PublishOutcome> {
+  if (signal?.aborted) throw new PublishCancelledError();
   try {
     const publish = page.locator('div[role=button]:has-text("Publish"), span:text-is("Publish")').first();
     if ((await publish.count()) === 0) {
@@ -1851,13 +1943,63 @@ export async function publishListing(): Promise<string> {
         `Refusing to click "${accessible}" because it is a Boost, promote, or other paid option. Nothing was published.`
       );
     }
-    await publish.click({ timeout: 10000 });
-    await page.waitForTimeout(5000);
-    return page.url();
+    if (signal?.aborted) throw new PublishCancelledError();
+    try {
+      await publish.click({ timeout: 10000 });
+    } catch (err) {
+      // A navigation that detaches the button still counts as the one click.
+      if (!stillOnCreate(pageUrl(page))) {
+        const url = pageUrl(page);
+        await closeListerTab();
+        return { status: "published", url };
+      }
+      if (hasDebugScreenshotNote(err)) throw err;
+      return throwListingFailure(page, err);
+    }
+
+    // The click has been issued. Any failure from here is unconfirmed, not a reason to click again.
+    try {
+      const left = await leftCreateFlow(page, publishConfirmMs());
+      const url = pageUrl(page);
+      if (!left || stillOnCreate(url)) {
+        return { status: "unconfirmed", url, message: UNCONFIRMED_PUBLISH_MESSAGE };
+      }
+      await closeListerTab();
+      return { status: "published", url };
+    } catch {
+      return { status: "unconfirmed", url: pageUrl(page), message: UNCONFIRMED_PUBLISH_MESSAGE };
+    }
   } catch (err) {
+    if (err instanceof PublishCancelledError) throw err;
     if (hasDebugScreenshotNote(err)) throw err;
     return throwListingFailure(page, err);
   }
+}
+
+async function leftCreateFlow(page: Page, timeoutMs: number): Promise<boolean> {
+  if (!stillOnCreate(pageUrl(page))) return true;
+  if (timeoutMs <= 0) return false;
+  try {
+    await page.waitForURL((url) => !stillOnCreate(url.toString()), { timeout: timeoutMs });
+    return true;
+  } catch {
+    return !stillOnCreate(pageUrl(page));
+  }
+}
+
+/**
+ * Click Publish on the review step. Returns the resulting URL once the page
+ * has left the create flow, or an unconfirmed result if that wait runs out.
+ * Publish is clicked once per call and never repeated.
+ *
+ * This only works while the draft from create_listing is still on screen, which
+ * holds as long as the server keeps running: both calls share one browser. If
+ * the browser has been restarted in between, the draft is gone, and a bare
+ * selector timeout would not explain why. Say what happened instead.
+ */
+export async function publishListing(signal?: AbortSignal): Promise<PublishOutcome> {
+  const page = await getPage();
+  return publishPreparedDraft(page, signal);
 }
 
 export interface MyListing {

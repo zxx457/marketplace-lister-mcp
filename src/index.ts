@@ -11,8 +11,10 @@ import {
   postListing,
   listMine,
   photosInFolder,
+  PublishCancelledError,
   type ListingDraft,
 } from "./listing.js";
+import { DuplicateListingError } from "./publish-guard.js";
 import { searchComps } from "./comps.js";
 
 const server = new McpServer({
@@ -147,7 +149,7 @@ server.tool(
 
 server.tool(
   "post_listing",
-  "Post one item to Marketplace in a single step: uploads the photos, fills the form, checks the review page really shows the title and price it was given, then publishes. This is the normal way to list something. Call it only after the seller has seen the wording and price you propose and agreed to them; show them the text first, in the message, rather than posting and asking afterwards. The price must be the seller's own number, never an estimate. Prefer this over create_listing plus publish_listing, which leave a draft that exists only while the browser stays open and is lost if anything interrupts. Optional location, hide_from_friends, product_tags, and share_to_groups do nothing when omitted. Boost, promote, and other paid options are never clicked.",
+  "Post one item to Marketplace in a single step: uploads the photos, fills the form, checks the review page really shows the title and price it was given, then clicks Publish exactly once. Posts take 1-4 minutes. Set the client's toolTimeoutSec to about 600 before calling. Never retry a timed-out call: the first attempt may still publish, and a retry lists the item twice. Check list_my_listings instead. The same title and price are refused for 6 hours while a post is in progress, published, or unconfirmed; pass allow_duplicate only to list a second copy on purpose. This is the normal way to list something. Call it only after the seller has seen the wording and price you propose and agreed to them; show them the text first, in the message, rather than posting and asking afterwards. The price must be the seller's own number, never an estimate. Prefer this over create_listing plus publish_listing, which leave a draft that exists only while the browser stays open and is lost if anything interrupts. Optional location, hide_from_friends, product_tags, and share_to_groups do nothing when omitted. Boost, promote, and other paid options are never clicked.",
   {
     title: z.string(),
     price: z
@@ -158,9 +160,18 @@ server.tool(
     condition: z.enum(CONDITIONS),
     folder: z.string().optional().describe("Folder holding this item's photos; every image in it is uploaded, sorted by filename."),
     photos: z.array(z.string()).optional().describe("Explicit photo paths (first is the cover), when picking specific files instead of a folder."),
+    allow_duplicate: z
+      .boolean()
+      .optional()
+      .describe(
+        "Optional. Set true only to list a second copy of the same title and price on purpose. Otherwise a matching post from the last 6 hours, including one still in progress or whose publish was not confirmed, is refused so a timed-out call cannot be listed twice."
+      ),
     ...extraListingFields,
   },
-  async ({ title, price, description, category, condition, folder, photos, location, hide_from_friends, product_tags, share_to_groups }) => {
+  async (
+    { title, price, description, category, condition, folder, photos, location, hide_from_friends, product_tags, share_to_groups, allow_duplicate },
+    extra
+  ) => {
     if (!(await isLoggedIn())) {
       return { content: [text("Not logged in. Call fb_login first.")], isError: true };
     }
@@ -170,24 +181,48 @@ server.tool(
     } catch (e) {
       return { content: [text(`${e instanceof Error ? e.message : String(e)}\nPass either "folder" or "photos".`)], isError: true };
     }
-    const draft = await postListing({
-      title,
-      price,
-      description,
-      category,
-      condition,
-      photos: files,
-      location,
-      hideFromFriends: hide_from_friends,
-      productTags: product_tags,
-      shareToGroups: share_to_groups,
-    });
-    return {
-      content: [
-        text(`Published "${title}" at $${price} (${condition}, ${category}). Now at: ${draft.url}\n${formatOutcome(draft)}`),
-        img(draft.screenshot),
-      ],
-    };
+    try {
+      const draft = await postListing(
+        {
+          title,
+          price,
+          description,
+          category,
+          condition,
+          photos: files,
+          location,
+          hideFromFriends: hide_from_friends,
+          productTags: product_tags,
+          shareToGroups: share_to_groups,
+        },
+        { signal: extra.signal, allowDuplicate: allow_duplicate === true }
+      );
+      if (draft.outcome === "cancelled") {
+        return { content: [text(draft.message)], isError: true };
+      }
+      if (draft.outcome === "unconfirmed") {
+        return {
+          content: [
+            text(
+              `${draft.message}\nPublish was clicked once for "${title}" at $${price} and the page stayed on the create flow. Do not call post_listing again for this item.\n${formatOutcome(draft)}`
+            ),
+            img(draft.screenshot),
+          ],
+          isError: true,
+        };
+      }
+      return {
+        content: [
+          text(`Published "${title}" at $${price} (${condition}, ${category}). Now at: ${draft.url}\n${formatOutcome(draft)}`),
+          img(draft.screenshot),
+        ],
+      };
+    } catch (err) {
+      if (err instanceof DuplicateListingError || err instanceof PublishCancelledError) {
+        return { content: [text(err.message)], isError: true };
+      }
+      throw err;
+    }
   }
 );
 
@@ -247,11 +282,21 @@ server.tool(
 
 server.tool(
   "publish_listing",
-  "Publish the listing currently on the review step (created by create_listing). Only call after the review screenshot has been confirmed. Returns the resulting URL. Never clicks a Boost, promote, or other paid option.",
+  "Publish the listing currently on the review step (created by create_listing). Clicks Publish once and waits for the page to leave the create flow. If that wait times out, the result is unconfirmed — check list_my_listings, do not retry, and do not click Publish again. Only call after the review screenshot has been confirmed. Never clicks a Boost, promote, or other paid option. Posts take 1-4 minutes; set toolTimeoutSec to about 600. Never retry a timed-out call.",
   {},
-  async () => {
-    const url = await publishListing();
-    return { content: [text(`Published. Now at: ${url}`)] };
+  async (_args, extra) => {
+    try {
+      const result = await publishListing(extra.signal);
+      if (result.status === "unconfirmed") {
+        return { content: [text(result.message)], isError: true };
+      }
+      return { content: [text(`Published. Now at: ${result.url}`)] };
+    } catch (err) {
+      if (err instanceof PublishCancelledError) {
+        return { content: [text(err.message)], isError: true };
+      }
+      throw err;
+    }
   }
 );
 

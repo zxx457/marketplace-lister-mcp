@@ -13,8 +13,9 @@ import { chromium, type Browser, type BrowserContext, type Page } from "playwrig
  * Opt-in: FB_MCP_CDP_URL, for example http://127.0.0.1:9230. The lister
  * attaches to a Chrome the user already started with remote debugging. That
  * is the same browser they post from by hand, so Facebook sees one session.
- * The lister opens its own tab in that window and, on shutdown, closes only
- * that tab. It does not close the browser or any other tab.
+ * The lister opens its own tab in that window. After a publish is confirmed,
+ * and again on shutdown, it closes only that tab. It does not close the
+ * browser or any other tab.
  */
 
 // One profile per marketplace, so adding another platform later doesn't share
@@ -225,6 +226,19 @@ export async function isLoggedIn(): Promise<boolean> {
   const c = await getContext();
   const cookies = await c.cookies("https://www.facebook.com");
   return cookies.some((ck) => ck.name === "c_user" && !!ck.value);
+}
+
+/**
+ * Close the tab this lister opened, and leave the user's other tabs and Chrome
+ * running. Used after a publish whose URL has left the create flow. No-op when
+ * the lister launched its own profile: that window is the lister's, and the
+ * next post reuses it.
+ */
+export async function closeListerTab(): Promise<void> {
+  if (!held || held.kind !== "cdp") return;
+  const page = held.page;
+  held.page = null;
+  if (page && !page.isClosed()) await page.close().catch(() => {});
 }
 
 export async function closeContext(): Promise<void> {
