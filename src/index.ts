@@ -3,7 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { smoothLogin } from "./login.js";
-import { isLoggedIn, profileDir, closeContext } from "./browser.js";
+import { isLoggedIn, closeContext, sessionDescription } from "./browser.js";
 import {
   scanItems,
   fillListing,
@@ -70,7 +70,7 @@ function formatOutcome(r: ListingDraft): string {
 
 server.tool(
   "fb_login",
-  "Open the dedicated Facebook browser and sign in. If already signed in, returns instantly. Otherwise a real Facebook login page opens; the user completes login (and any 2FA) once, and the session is saved to a dedicated profile for all future runs. The user only ever types their password on Facebook's own page.",
+  "Sign in to Facebook for the lister. If FB_MCP_CDP_URL is set, the lister uses the Chrome already open at that address and does not start a second browser or its own login. Otherwise it opens the dedicated browser; the user signs in once on Facebook's own page and the session is saved there.",
   {},
   async () => {
     const r = await smoothLogin();
@@ -80,11 +80,15 @@ server.tool(
 
 server.tool(
   "fb_login_status",
-  "Check whether the dedicated Facebook profile is currently logged in. Returns the profile directory path too.",
+  "Check whether Facebook is signed in. If FB_MCP_CDP_URL is set, this reads the Chrome already open at that address and does not start another browser. Otherwise it reports the dedicated profile directory.",
   {},
   async () => {
-    const ok = await isLoggedIn().catch(() => false);
-    return { content: [text(`logged_in: ${ok}\nprofile_dir: ${profileDir()}`)] };
+    try {
+      const ok = await isLoggedIn();
+      return { content: [text(`logged_in: ${ok}\n${sessionDescription()}`)] };
+    } catch (err) {
+      return { content: [text(err instanceof Error ? err.message : String(err))], isError: true };
+    }
   }
 );
 

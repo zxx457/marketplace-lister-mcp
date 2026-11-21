@@ -140,4 +140,6 @@ For the curious. You never call these by name; Claude picks them.
 
 `location`, `hide_from_friends`, `product_tags`, and `share_to_groups` are optional on `post_listing` and `create_listing`. Leave them out and the form is filled as before. Paid Boost or promote controls are never clicked.
 
-Settings, if you ever need them: `FB_MCP_PROFILE_DIR` moves where your login is stored, `FB_MCP_CHANNEL` picks a specific browser (`chrome` or `msedge`).
+Settings, if you ever need them: `FB_MCP_PROFILE_DIR` moves where the dedicated login is stored, `FB_MCP_CHANNEL` picks a specific browser (`chrome` or `msedge`).
+
+To post from the Chrome you already use, instead of a second Facebook session, start that Chrome with remote debugging and set `FB_MCP_CDP_URL` to its address (for example `http://127.0.0.1:9230`) on the marketplace-lister process. The lister opens a tab in that window and leaves the rest of the window alone. Leave the variable unset and it launches its own profile, as before.

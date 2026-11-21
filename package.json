@@ -38,7 +38,7 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "test": "tsc && node --test test/create-upload.test.mjs",
+    "test": "tsc && node --test test/*.test.mjs",
     "prepare": "tsc"
   },
   "engines": {
